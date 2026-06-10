@@ -1,0 +1,20 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Editor settings
+.vscode/
