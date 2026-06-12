@@ -53,6 +53,8 @@ $pyInstallerArgs = @(
     "--name", $buildName,
     "--collect-all", "streamlit",
     "--hidden-import", "streamlit.web.cli",
+    "--collect-all", "postgrest",
+    "--hidden-import", "postgrest",
     "--add-data", "$appFilePath;.",
     "--add-data", "$logoFilePath;.",
     $launcherFilePath
