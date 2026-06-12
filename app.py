@@ -5866,6 +5866,16 @@ def page_members(pg: SyncPostgrestClient):
             due_label = f"{m['next_billing_date']} ({days_left:+d}d)"
         except Exception:
             due_label = m.get("next_billing_date", "")
+
+        months_active = ""
+        join_date_str = m.get("join_date", "")
+        if join_date_str:
+            try:
+                join_date = datetime.datetime.strptime(join_date_str, "%Y-%m-%d").date()
+                months_active = (today.year - join_date.year) * 12 + today.month - join_date.month
+            except Exception:
+                pass
+
         rows.append(
             {
                 "ID": m["id"],
@@ -5876,6 +5886,7 @@ def page_members(pg: SyncPostgrestClient):
                 "Status": m.get("status", ""),
                 "Locker": m.get("locker", ""),
                 "Join Date": m.get("join_date", ""),
+                "Months Active": months_active,
                 "Next Bill": due_label,
             }
         )
