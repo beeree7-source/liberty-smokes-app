@@ -1,6 +1,8 @@
 param(
     [string]$TaskName = "LibertySmokes-ReminderEmails",
     [string]$StartTime = "08:00",
+    [ValidateRange(1, 1440)]
+    [int]$EveryMinutes,
     [switch]$RunAsSystem,
     [switch]$Force
 )
@@ -41,20 +43,37 @@ if ($taskExists -and $Force) {
 }
 
 $command = '"' + $PythonExe + '" "' + $Runner + '"'
+$runAsUser = if ($RunAsSystem) { "SYSTEM" } else { $env:USERNAME }
 
-schtasks.exe /Create `
-    /TN $TaskName `
-    /TR $command `
-    /SC DAILY `
-    /ST $StartTime `
-    /RU $(if ($RunAsSystem) { "SYSTEM" } else { $env:USERNAME }) `
-    /F | Out-Null
+if ($PSBoundParameters.ContainsKey('EveryMinutes')) {
+    schtasks.exe /Create `
+        /TN $TaskName `
+        /TR $command `
+        /SC MINUTE `
+        /MO $EveryMinutes `
+        /RU $runAsUser `
+        /F | Out-Null
+} else {
+    schtasks.exe /Create `
+        /TN $TaskName `
+        /TR $command `
+        /SC DAILY `
+        /ST $StartTime `
+        /RU $runAsUser `
+        /F | Out-Null
+}
 
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to create scheduled task."
 }
 
-if ($RunAsSystem) {
+if ($PSBoundParameters.ContainsKey('EveryMinutes')) {
+    if ($RunAsSystem) {
+        Write-Host "Created task '$TaskName' to run every $EveryMinutes minute(s) as SYSTEM."
+    } else {
+        Write-Host "Created task '$TaskName' to run every $EveryMinutes minute(s) as $env:USERNAME."
+    }
+} elseif ($RunAsSystem) {
     Write-Host "Created task '$TaskName' to run daily at $StartTime as SYSTEM."
 } else {
     Write-Host "Created task '$TaskName' to run daily at $StartTime as $env:USERNAME."

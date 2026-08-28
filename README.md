@@ -82,6 +82,101 @@ The app includes a Sales Ledger page backed by `daily_sales_ledger`:
 streamlit run app.py
 ```
 
+## Data Safety Backup (Recommended Before Changes)
+
+This project includes a read-only backup script that exports key Supabase tables to CSV.
+
+Run:
+
+```powershell
+\.\.venv\Scripts\python.exe .\scripts\backup_supabase_to_csv.py
+```
+
+Output:
+
+- Creates a timestamped folder under `backups/`.
+- Exports tables like `members`, `seats`, `member_monthly_refills`, `daily_sales_ledger`, and `settings`.
+- Does not write or modify any Supabase data.
+
+Optional:
+
+```powershell
+\.\.venv\Scripts\python.exe .\scripts\backup_supabase_to_csv.py --tables members seats settings --strict
+```
+
+## Streamlit Deployment Workflow (Dev + Prod)
+
+You can continue local development normally after deploying to Streamlit.
+
+Recommended branch flow:
+
+1. Keep `main` as production.
+2. Create feature branches for new work:
+  ```bash
+  git checkout -b feature/<short-name>
+  ```
+3. Test locally before opening a PR:
+  ```bash
+  streamlit run app.py
+  ```
+4. Merge only verified changes into `main`.
+5. Streamlit redeploys from `main` (if your app is connected to that branch).
+
+Suggested release checklist:
+
+- Confirm local app behavior for the changed pages and forms.
+- Run smoke checks:
+  ```bash
+  python scripts/predeploy_smoke_test.py
+  ```
+- Validate Supabase writes/reads for impacted tables.
+- Confirm `.streamlit/secrets.toml` is not committed.
+- Update `requirements.txt` if dependencies changed.
+- Merge to `main` only after checks pass.
+
+Safe rollback:
+
+If a release causes issues, revert the bad commit on `main` and push:
+
+```bash
+git revert <commit-sha>
+git push
+```
+
+Streamlit will redeploy the reverted state.
+
+## Hotfix Process (Production)
+
+Use this flow for urgent fixes when production is broken or blocked.
+
+1. Start from latest production:
+  ```bash
+  git checkout main
+  git pull
+  ```
+2. Create a focused hotfix branch:
+  ```bash
+  git checkout -b hotfix/<short-name>
+  ```
+3. Implement the smallest safe change.
+4. Validate quickly:
+  ```bash
+  python scripts/predeploy_smoke_test.py
+  streamlit run app.py
+  ```
+5. Merge hotfix to `main` and push immediately.
+6. Confirm Streamlit redeploy and verify affected pages.
+7. If needed, rollback fast:
+  ```bash
+  git revert <commit-sha>
+  git push
+  ```
+
+Optional but recommended:
+
+- Tag each production fix after verification (`vYYYY.MM.DD-hotfixN`).
+- Back-merge hotfix changes into any active feature branch.
+
 ## Build Windows EXE
 
 This project includes a repeatable PyInstaller build script:

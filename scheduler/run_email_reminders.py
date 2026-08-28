@@ -34,6 +34,8 @@ EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY = "email_reminders_auto_interval_min_v1"
 EMAIL_REMINDERS_AUTO_LAST_RUN_KEY = "email_reminders_auto_last_run_v1"
 EMAIL_REMINDERS_AUTO_LAST_RESULT_KEY = "email_reminders_auto_last_result_v1"
 
+_SETTINGS_CACHE: dict[str, str] | None = None
+
 
 def _bool_setting(value: str, default: bool = False) -> bool:
     if value is None or value == "":
@@ -73,22 +75,46 @@ def get_postgrest_client(url: str, key: str) -> SyncPostgrestClient:
     )
 
 
-def get_setting(pg: SyncPostgrestClient, key: str) -> str:
+def _load_settings_cache(pg: SyncPostgrestClient) -> dict[str, str]:
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
+
     try:
-        rows = pg.from_("settings").select("value").eq("key", key).execute().data
-        if not rows:
-            return ""
-        return str(rows[0].get("value") or "")
+        rows = pg.from_("settings").select("key, value").execute().data or []
     except Exception:
-        return ""
+        _SETTINGS_CACHE = {}
+        return _SETTINGS_CACHE
+
+    settings_map: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key") or "").strip()
+        if not key:
+            continue
+        settings_map[key] = str(row.get("value") or "")
+    _SETTINGS_CACHE = settings_map
+    return _SETTINGS_CACHE
+
+
+def _invalidate_settings_cache() -> None:
+    global _SETTINGS_CACHE
+    _SETTINGS_CACHE = None
+
+
+def get_setting(pg: SyncPostgrestClient, key: str) -> str:
+    settings_map = _load_settings_cache(pg)
+    return str(settings_map.get(key) or "")
 
 
 def save_setting(pg: SyncPostgrestClient, key: str, value: str):
-    existing = pg.from_("settings").select("key").eq("key", key).execute().data
-    if existing:
+    settings_map = _load_settings_cache(pg)
+    if key in settings_map:
         pg.from_("settings").update({"value": value}).eq("key", key).execute()
     else:
         pg.from_("settings").insert({"key": key, "value": value}).execute()
+    _invalidate_settings_cache()
 
 
 def fetch_members(pg: SyncPostgrestClient) -> list[dict]:

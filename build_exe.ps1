@@ -16,10 +16,14 @@ if (-not (Test-Path $venvPython)) {
 
 $appFilePath = Join-Path $projectRoot "app.py"
 $logoFilePath = Join-Path $projectRoot "logo.png"
+$iconFilePath = Join-Path $projectRoot "logo.ico"
 $launcherFilePath = Join-Path $projectRoot "launcher.py"
 
 if (-not (Test-Path $appFilePath)) {
     throw "Could not find app file at $appFilePath"
+}
+if (-not (Test-Path $logoFilePath)) {
+    throw "Could not find logo file at $logoFilePath"
 }
 if (-not (Test-Path $launcherFilePath)) {
     throw "Could not find launcher file at $launcherFilePath"
@@ -34,6 +38,15 @@ $buildName = "LibertySmokes-$safeVersionTag"
 
 Write-Host "Using Python: $venvPython"
 & $venvPython -m pip install --upgrade pip pyinstaller
+
+if (-not (Test-Path $iconFilePath)) {
+    Write-Host "Creating icon file: $iconFilePath"
+    $iconGenCode = "from PIL import Image; img=Image.open(r'''$logoFilePath''').convert('RGBA'); img.save(r'''$iconFilePath''', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
+    & $venvPython -c $iconGenCode
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create icon file from $logoFilePath"
+    }
+}
 
 $distPath = Join-Path $projectRoot "dist"
 $buildPath = Join-Path $projectRoot "build"
@@ -51,6 +64,7 @@ $pyInstallerArgs = @(
     "--onedir",
     "--specpath", "build",
     "--name", $buildName,
+    "--icon", $iconFilePath,
     "--collect-all", "streamlit",
     "--hidden-import", "streamlit.web.cli",
     "--add-data", "$appFilePath;.",

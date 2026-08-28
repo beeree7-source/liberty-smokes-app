@@ -3,18 +3,23 @@ import base64
 import csv
 import datetime
 import hashlib
+import html
 import io
 import importlib
 import json
+import mimetypes
+import re
 import socket
 from pathlib import Path
 import smtplib
+import uuid
 from email.message import EmailMessage
 from email.utils import parseaddr
 from urllib.parse import urlparse
 
 import requests
 import streamlit as st
+import pandas as pd
 from postgrest import SyncPostgrestClient
 import streamlit.components.v1 as components
 from streamlit.errors import StreamlitAPIException
@@ -71,6 +76,13 @@ def apply_mobile_styles(enabled: bool = True):
 
 # ── DB client ──────────────────────────────────────────────────────────────────
 
+@st.cache_resource
+def _build_postgrest_client(url: str, key: str) -> SyncPostgrestClient:
+    return SyncPostgrestClient(
+        f"{url.rstrip('/')}/rest/v1",
+        headers={"apikey": key, "Authorization": f"Bearer {key}"},
+    )
+
 def get_postgrest_client() -> SyncPostgrestClient:
     url = st.secrets.get("SUPABASE_URL")
     key = st.secrets.get("SUPABASE_KEY")
@@ -90,10 +102,7 @@ def get_postgrest_client() -> SyncPostgrestClient:
             "Check .streamlit/secrets.toml for typos in SUPABASE_URL and verify your internet/DNS connection."
         )
         st.stop()
-    return SyncPostgrestClient(
-        f"{url.rstrip('/')}/rest/v1",
-        headers={"apikey": key, "Authorization": f"Bearer {key}"},
-    )
+    return _build_postgrest_client(str(url).strip(), str(key).strip())
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -134,27 +143,27 @@ def month_label(month_start: str) -> str:
         return str(month_start)
 
 
-WEEKDAY_OPTIONS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-WEEKDAY_TO_INDEX = {name: idx for idx, name in enumerate(WEEKDAY_OPTIONS)}
+def _parse_iso_date(value: str | None) -> datetime.date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
 
 
-def _normalize_weekday_name(value: str, default: str = "Friday") -> str:
-    raw = str(value or "").strip().capitalize()
-    return raw if raw in WEEKDAY_TO_INDEX else default
-
-
-def _weekday_range_indices(start_day: str, end_day: str) -> set[int]:
-    start_idx = WEEKDAY_TO_INDEX.get(_normalize_weekday_name(start_day), 4)
-    end_idx = WEEKDAY_TO_INDEX.get(_normalize_weekday_name(end_day, "Sunday"), 6)
-    out = {start_idx}
-    while start_idx != end_idx:
-        start_idx = (start_idx + 1) % 7
-        out.add(start_idx)
-    return out
-
-
-def _weekday_label(start_day: str, end_day: str) -> str:
-    return f"{_normalize_weekday_name(start_day)} through {_normalize_weekday_name(end_day, 'Sunday')}"
+def member_active_months(member: dict, as_of: datetime.date | None = None) -> int:
+    join_date = _parse_iso_date(member.get("join_date"))
+    if not join_date:
+        return 0
+    as_of = as_of or datetime.date.today()
+    if join_date > as_of:
+        return 0
+    months = (as_of.year - join_date.year) * 12 + (as_of.month - join_date.month) + 1
+    if as_of.day < join_date.day:
+        months -= 1
+    return max(1, months)
 
 
 def sale_month_start(created_at: str) -> str:
@@ -379,7 +388,7 @@ def fetch_members(pg: SyncPostgrestClient):
             pg.from_("members")
             .select(
                 "id, first_name, last_name, email, phone, tier, status, locker, gift_card_number, "
-                "join_date, next_billing_date, last_reminder"
+                "join_date, next_billing_date, last_reminder, next_gift_card_refill_date, last_gift_card_refill_date"
             )
             .execute()
             .data or []
@@ -445,6 +454,154 @@ def update_member_gift_card_number(
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+def update_member_gift_card_refill_date(
+    pg: SyncPostgrestClient,
+    member_id,
+    refill_date: str | None,
+    credit_months: int = 1,
+) -> tuple[bool, str]:
+    """Update the next_gift_card_refill_date for a member and add to monthly refills tracker."""
+    if member_id in {None, ""}:
+        return False, "Member is required."
+    try:
+        # Fetch the member to get their tier and next_billing_date
+        member_data = pg.from_("members").select("tier, next_billing_date").eq("id", member_id).execute().data
+        if not member_data:
+            return False, "Member not found"
+        
+        member = member_data[0]
+        tier = member.get("tier", "Monthly")
+        next_billing_date = member.get("next_billing_date")
+        
+        # Calculate next refill date based on tier
+        if tier == "Annual":
+            # For annual members, next refill is at the beginning of next month
+            today = datetime.date.today()
+            # First day of next month
+            next_refill = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        else:  # Monthly
+            # For monthly members, next refill is after next billing date
+            if next_billing_date:
+                try:
+                    if isinstance(next_billing_date, str):
+                        next_refill_dt = datetime.datetime.strptime(next_billing_date, "%Y-%m-%d").date()
+                    else:
+                        next_refill_dt = next_billing_date
+                    # Add a month to the next billing date
+                    next_refill = (next_refill_dt.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+                except Exception:
+                    next_refill = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+            else:
+                next_refill = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        
+        # Update the members table with last refill and next refill dates
+        update_data = {
+            "last_gift_card_refill_date": datetime.datetime.now().isoformat(),
+            "next_gift_card_refill_date": next_refill.isoformat()
+        }
+        pg.from_("members").update(update_data).eq("id", member_id).execute()
+        
+        # Also add to monthly refills tracker for the current month (only if not already tracked)
+        if isinstance(refill_date, str):
+            refill_dt = datetime.datetime.strptime(refill_date, "%Y-%m-%d").date()
+        else:
+            refill_dt = refill_date or datetime.date.today()
+        
+        month_start = month_start_for(refill_dt)
+        now_iso = datetime.datetime.now().isoformat()
+        credit_months = max(1, int(credit_months or 1))
+        refill_payload = {
+            "member_id": member_id,
+            "month_start": month_start,
+            "amount": 25.00,
+            "refilled_at": now_iso,
+            "notes": build_refill_note_with_credit("Auto-marked from daily refill list", credit_months),
+        }
+        
+        # Try to insert, or update if it already exists
+        try:
+            pg.from_("member_monthly_refills").insert(refill_payload).execute()
+        except Exception:
+            # Record might already exist, try to update it
+            pg.from_("member_monthly_refills").update({
+                "refilled_at": now_iso,
+                "notes": build_refill_note_with_credit("Auto-marked from daily refill list", credit_months)
+            }).eq("member_id", member_id).eq("month_start", month_start).execute()
+        
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def skip_member_gift_card_refill(
+    pg: SyncPostgrestClient,
+    member_id,
+) -> tuple[bool, str]:
+    """Skip refill for a member - just update next refill date without creating monthly record."""
+    if member_id in {None, ""}:
+        return False, "Member is required."
+    try:
+        # Fetch the member to get their tier and next_billing_date
+        member_data = pg.from_("members").select("tier, next_billing_date").eq("id", member_id).execute().data
+        if not member_data:
+            return False, "Member not found"
+        
+        member = member_data[0]
+        tier = member.get("tier", "Monthly")
+        next_billing_date = member.get("next_billing_date")
+        
+        # Calculate next refill date based on tier
+        if tier == "Annual":
+            # For annual members, next refill is at the beginning of next month
+            today = datetime.date.today()
+            # First day of next month
+            next_refill = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        else:  # Monthly
+            # For monthly members, next refill is after next billing date
+            if next_billing_date:
+                try:
+                    if isinstance(next_billing_date, str):
+                        next_refill_dt = datetime.datetime.strptime(next_billing_date, "%Y-%m-%d").date()
+                    else:
+                        next_refill_dt = next_billing_date
+                    # Add a month to the next billing date
+                    next_refill = (next_refill_dt.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+                except Exception:
+                    next_refill = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+            else:
+                next_refill = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        
+        # Only update the next refill date, don't create a monthly record
+        update_data = {
+            "next_gift_card_refill_date": next_refill.isoformat()
+        }
+        pg.from_("members").update(update_data).eq("id", member_id).execute()
+        
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def parse_refill_credit_months(note_text: str) -> int:
+    match = re.search(r"\[credit_months=(\d+)\]", str(note_text or ""))
+    if not match:
+        return 1
+    try:
+        return max(1, int(match.group(1)))
+    except Exception:
+        return 1
+
+
+def build_refill_note_with_credit(note_text: str, credit_months: int) -> str:
+    base = re.sub(r"\s*\[credit_months=\d+\]\s*", " ", str(note_text or "")).strip()
+    credit_months = max(1, int(credit_months or 1))
+    if credit_months <= 1:
+        return base
+    if base:
+        return f"{base} [credit_months={credit_months}]"
+    return f"[credit_months={credit_months}]"
 
 
 def member_locker_label(member: dict) -> str:
@@ -551,7 +708,34 @@ def add_member(pg: SyncPostgrestClient, first_name, last_name, email, phone, tie
     return payload
 
 
-def update_member(pg: SyncPostgrestClient, member_id, first_name, last_name, email, phone, locker, status):
+def gift_card_refill_due_on_activation(tier: str) -> str:
+    today = datetime.date.today()
+    tier_text = str(tier or "").strip().lower()
+    if tier_text == "annual":
+        return today.replace(day=1).isoformat()
+    return today.isoformat()
+
+
+def update_member(pg: SyncPostgrestClient, member_id, first_name, last_name, email, phone, locker, status, tier=None):
+    previous_status = ""
+    previous_tier = ""
+    try:
+        existing_rows = (
+            pg.from_("members")
+            .select("status, tier")
+            .eq("id", member_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if existing_rows:
+            previous_status = str(existing_rows[0].get("status") or "").strip().lower()
+            previous_tier = str(existing_rows[0].get("tier") or "").strip()
+    except Exception:
+        previous_status = ""
+        previous_tier = ""
+
     payload = {
         "first_name": first_name,
         "last_name": last_name,
@@ -560,11 +744,25 @@ def update_member(pg: SyncPostgrestClient, member_id, first_name, last_name, ema
         "locker": locker,
         "status": status,
     }
+    if tier:
+        payload["tier"] = tier
     try:
         pg.from_("members").update(payload).eq("id", member_id).execute()
     except Exception:
         payload.pop("phone", None)
         pg.from_("members").update(payload).eq("id", member_id).execute()
+
+    new_status = str(status or "").strip().lower()
+    transitioned_to_active = new_status == "active" and previous_status not in {"", "active"}
+    if transitioned_to_active:
+        effective_tier = str(tier or previous_tier or "Monthly").strip()
+        try:
+            pg.from_("members").update(
+                {"next_gift_card_refill_date": gift_card_refill_due_on_activation(effective_tier)}
+            ).eq("id", member_id).execute()
+        except Exception:
+            # Keep member edits working even if refill columns are not present yet.
+            pass
 
 
 def delete_member(pg: SyncPostgrestClient, member_id):
@@ -579,6 +777,15 @@ def process_payment(pg: SyncPostgrestClient, member_id, tier, current_due, month
             "last_reminder": "None",
         }
     ).eq("id", member_id).execute()
+
+    # Monthly renewals/reactivations should show in refill reminders immediately.
+    try:
+        pg.from_("members").update(
+            {"next_gift_card_refill_date": gift_card_refill_due_on_activation(str(tier or "Monthly"))}
+        ).eq("id", member_id).execute()
+    except Exception:
+        # Keep payment flow working even if refill tracking columns are not present.
+        pass
 
 
 def fetch_member_monthly_drinks(
@@ -680,12 +887,13 @@ def mark_member_monthly_refill(
     month_start: str | None = None,
     amount: float = 25.0,
     notes: str = "",
+    credit_months: int = 1,
 ) -> tuple[bool, str]:
     if member_id in {None, ""}:
         return False, "Member is required."
     month_start = month_start or month_start_for()
     amount = round(max(0.0, float(amount or 0.0)), 2)
-    note_text = str(notes or "").strip()
+    note_text = build_refill_note_with_credit(str(notes or "").strip(), int(credit_months or 1))
     now_iso = datetime.datetime.utcnow().isoformat()
 
     try:
@@ -744,6 +952,107 @@ def unmark_member_monthly_refill(
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+def apply_refill_credit_adjustment(
+    pg: SyncPostgrestClient,
+    member_id,
+    extra_months: int,
+    month_start: str | None = None,
+) -> tuple[bool, str]:
+    if member_id in {None, ""}:
+        return False, "Member is required."
+    extra_months = max(1, int(extra_months or 1))
+    month_start = month_start or month_start_for()
+    now_iso = datetime.datetime.utcnow().isoformat()
+
+    try:
+        rows = (
+            pg.from_("member_monthly_refills")
+            .select("member_id, notes, amount")
+            .eq("member_id", member_id)
+            .eq("month_start", month_start)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+
+        if rows:
+            existing = rows[0]
+            existing_notes = str(existing.get("notes") or "").strip()
+            current_credit = parse_refill_credit_months(existing_notes)
+            next_credit = current_credit + extra_months
+            next_notes = build_refill_note_with_credit(existing_notes, next_credit)
+            (
+                pg.from_("member_monthly_refills")
+                .update({"notes": next_notes, "refilled_at": now_iso})
+                .eq("member_id", member_id)
+                .eq("month_start", month_start)
+                .execute()
+            )
+            return True, ""
+
+        payload = {
+            "member_id": member_id,
+            "month_start": month_start,
+            "amount": 0.0,
+            "refilled_at": now_iso,
+            "notes": build_refill_note_with_credit("Tracking catch-up adjustment", extra_months),
+        }
+        pg.from_("member_monthly_refills").insert(payload).execute()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def backfill_missing_gift_card_refill_dates(pg: SyncPostgrestClient) -> int:
+    """Backfill missing due dates for active monthly members not refilled this month."""
+    updated = 0
+    try:
+        month_rows = fetch_member_monthly_refills(pg, month_start=month_start_for())
+        refilled_this_month = {str(row.get("member_id")) for row in month_rows}
+        active_monthly = (
+            pg.from_("members")
+            .select("id")
+            .eq("status", "Active")
+            .eq("tier", "Monthly")
+            .is_("next_gift_card_refill_date", "null")
+            .execute()
+            .data
+            or []
+        )
+        for member in active_monthly:
+            member_id = str(member.get("id") or "").strip()
+            if not member_id or member_id in refilled_this_month:
+                continue
+            try:
+                pg.from_("members").update(
+                    {"next_gift_card_refill_date": datetime.date.today().isoformat()}
+                ).eq("id", member_id).execute()
+                updated += 1
+            except Exception:
+                continue
+    except Exception:
+        return updated
+    return updated
+
+
+def fetch_gift_card_refill_due(pg: SyncPostgrestClient):
+    """Fetch members due for gift card refill from the view."""
+    # Keep old reactivations from being skipped in the due list.
+    backfill_missing_gift_card_refill_dates(pg)
+
+    try:
+        members = (
+            pg.from_("gift_card_refill_due")
+            .select("*")
+            .execute()
+            .data or []
+        )
+        return members
+    except Exception:
+        return []
 
 
 def fetch_daily_sales_ledger(
@@ -1559,9 +1868,30 @@ def import_members_csv(pg: SyncPostgrestClient, csv_text: str) -> tuple[int, int
 
 # ── Settings helpers ───────────────────────────────────────────────────────────
 
-def get_setting(pg: SyncPostgrestClient, key: str) -> str:
+SETTINGS_CACHE_KEY = "_settings_cache_map_v1"
+SETTINGS_CACHE_AT_KEY = "_settings_cache_at_v1"
+SETTINGS_CACHE_TTL_SECONDS = 30.0
+
+
+def _invalidate_settings_cache() -> None:
+    st.session_state.pop(SETTINGS_CACHE_KEY, None)
+    st.session_state.pop(SETTINGS_CACHE_AT_KEY, None)
+
+
+def _load_settings_cache(pg: SyncPostgrestClient, force: bool = False) -> dict[str, str]:
+    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    cached = st.session_state.get(SETTINGS_CACHE_KEY)
+    cached_at = st.session_state.get(SETTINGS_CACHE_AT_KEY)
+    if (
+        not force
+        and isinstance(cached, dict)
+        and isinstance(cached_at, (int, float))
+        and (now_ts - float(cached_at)) < SETTINGS_CACHE_TTL_SECONDS
+    ):
+        return cached
+
     try:
-        rows = pg.from_("settings").select("value").eq("key", key).execute().data
+        rows = pg.from_("settings").select("key, value").execute().data or []
     except Exception as exc:
         if "getaddrinfo failed" in str(exc).lower():
             st.error(
@@ -1570,19 +1900,37 @@ def get_setting(pg: SyncPostgrestClient, key: str) -> str:
             )
             st.stop()
         raise
-    return rows[0]["value"] if rows else ""
+
+    settings_map: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key") or "").strip()
+        if not key:
+            continue
+        settings_map[key] = str(row.get("value") or "")
+
+    st.session_state[SETTINGS_CACHE_KEY] = settings_map
+    st.session_state[SETTINGS_CACHE_AT_KEY] = now_ts
+    return settings_map
+
+def get_setting(pg: SyncPostgrestClient, key: str) -> str:
+    settings_map = _load_settings_cache(pg)
+    return str(settings_map.get(key) or "")
 
 
 def save_setting(pg: SyncPostgrestClient, key: str, value: str):
-    existing = pg.from_("settings").select("key").eq("key", key).execute().data
-    if existing:
+    settings_map = _load_settings_cache(pg)
+    if key in settings_map:
         pg.from_("settings").update({"value": value}).eq("key", key).execute()
     else:
         pg.from_("settings").insert({"key": key, "value": value}).execute()
+    _invalidate_settings_cache()
 
 
 def clear_setting(pg: SyncPostgrestClient, key: str):
     pg.from_("settings").delete().eq("key", key).execute()
+    _invalidate_settings_cache()
 
 
 MEMBER_EDIT_UNDO_KEY = "member_edit_undo_v1"
@@ -1643,6 +1991,8 @@ POS_LOYALTY_CUSTOMERS_KEY = "pos_loyalty_customers_v1"
 NAV_SHOW_POS_KEY = "nav_show_pos_v1"
 NAV_SHOW_SCANNER_KEY = "nav_show_scanner_v1"
 MEMBER_MARGIN_SECTION_KEY = "members_show_margin_section_v1"
+MEMBER_DRINK_TRACKER_SECTION_KEY = "members_show_drink_tracker_section_v1"
+MEMBER_MASS_TEXT_SECTION_KEY = "members_show_mass_text_section_v1"
 DRINK_CATALOG_KEY = "drink_catalog_v1"
 
 CIGARPOS_BASE_URL_KEY = "cigarpos_base_url"
@@ -1664,8 +2014,6 @@ SCHEDULE_EMAIL_AUTO_LAST_RUN_KEY = "schedule_email_auto_last_run_v1"
 SCHEDULE_EMAIL_AUTO_LAST_RESULT_KEY = "schedule_email_auto_last_result_v1"
 ORDERING_REPS_KEY = "ordering_sales_reps_v1"
 ORDERING_COMPANIES_KEY = "ordering_companies_v1"
-SALES_LEDGER_WEEKEND_START_KEY = "sales_ledger_weekend_start_day_v1"
-SALES_LEDGER_WEEKEND_END_KEY = "sales_ledger_weekend_end_day_v1"
 
 
 def _load_json_list_setting(pg: SyncPostgrestClient, key: str) -> list[dict]:
@@ -4721,6 +5069,8 @@ def send_email(
     body: str,
     security: str = "SSL",
     from_addr: str = "",
+    attachments: list[dict] | None = None,
+    inline_images: list[dict] | None = None,
 ):
     normalized_to = parseaddr(str(to_addr or "").strip())[1].strip()
     if not normalized_to or "@" not in normalized_to:
@@ -4730,7 +5080,93 @@ def send_email(
     msg["Subject"] = subject
     msg["From"] = from_addr or smtp_user
     msg["To"] = normalized_to
-    msg.set_content(body + "\n\nBest,\nLiberty Smokes Management")
+    text_body = body + "\n\nBest,\nLiberty Smokes Management"
+    msg.set_content(text_body)
+
+    safe_inline_images: list[dict] = []
+    for image in inline_images or []:
+        if not isinstance(image, dict):
+            continue
+        raw_content = image.get("content", b"")
+        if isinstance(raw_content, str):
+            content = raw_content.encode("utf-8")
+        elif isinstance(raw_content, (bytes, bytearray)):
+            content = bytes(raw_content)
+        else:
+            continue
+        if not content:
+            continue
+        filename = str(image.get("filename") or "image").strip() or "image"
+        mime_type = str(image.get("mime_type") or "").strip()
+        if not mime_type:
+            guessed_type, _ = mimetypes.guess_type(filename)
+            mime_type = guessed_type or "application/octet-stream"
+        if not mime_type.lower().startswith("image/"):
+            continue
+        safe_inline_images.append(
+            {
+                "filename": filename,
+                "mime_type": mime_type,
+                "content": content,
+                "cid": str(image.get("cid") or f"img-{uuid.uuid4().hex}@libertysmokes"),
+            }
+        )
+
+    if safe_inline_images:
+        escaped_body = html.escape(body).replace("\n", "<br>")
+        image_tags = "".join(
+            f'<div style="margin-top:12px;"><img src="cid:{img["cid"]}" alt="{html.escape(img["filename"])}" style="max-width:100%;height:auto;"></div>'
+            for img in safe_inline_images
+        )
+        html_body = (
+            "<html><body>"
+            f"<div>{escaped_body}</div>"
+            "<div style=\"margin-top:16px;\">Best,<br>Liberty Smokes Management</div>"
+            f"{image_tags}"
+            "</body></html>"
+        )
+        msg.add_alternative(html_body, subtype="html")
+        html_part = msg.get_payload()[-1]
+        for img in safe_inline_images:
+            maintype, subtype = img["mime_type"].split("/", 1)
+            html_part.add_related(
+                img["content"],
+                maintype=maintype,
+                subtype=subtype,
+                cid=f"<{img['cid']}>",
+                filename=img["filename"],
+                disposition="inline",
+            )
+
+    for attachment in attachments or []:
+        if not isinstance(attachment, dict):
+            continue
+        filename = str(attachment.get("filename") or "attachment.bin").strip() or "attachment.bin"
+        raw_content = attachment.get("content", b"")
+        if isinstance(raw_content, str):
+            content = raw_content.encode("utf-8")
+        elif isinstance(raw_content, (bytes, bytearray)):
+            content = bytes(raw_content)
+        else:
+            continue
+        if not content:
+            continue
+
+        mime_type = str(attachment.get("mime_type") or "").strip()
+        if not mime_type:
+            guessed_type, _ = mimetypes.guess_type(filename)
+            mime_type = guessed_type or "application/octet-stream"
+        if "/" in mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+
+        msg.add_attachment(
+            content,
+            maintype=maintype,
+            subtype=subtype,
+            filename=filename,
+        )
 
     security_mode = (security or "SSL").upper()
     if security_mode == "SSL":
@@ -4895,6 +5331,8 @@ def send_mass_member_email(
     recipients: list[dict],
     subject_template: str,
     body_template: str,
+    attachments: list[dict] | None = None,
+    inline_images: list[dict] | None = None,
 ) -> tuple[int, list[tuple[str, str]]]:
     sent_count = 0
     failures: list[tuple[str, str]] = []
@@ -4913,11 +5351,333 @@ def send_mass_member_email(
                 format_email_template(body_template, member),
                 security=smtp["security"],
                 from_addr=smtp["from_addr"],
+                attachments=attachments,
+                inline_images=inline_images,
             )
             sent_count += 1
         except Exception as exc:
             failures.append((member_email_label(member), str(exc)))
     return sent_count, failures
+
+
+def render_member_communications_section(
+    pg: SyncPostgrestClient,
+    members: list[dict],
+    show_member_mass_text_section: bool,
+):
+    st.subheader("Mass Email Members")
+
+    members_with_email = [m for m in members if str(m.get("email") or "").strip()]
+    if not members_with_email:
+        st.info("No members with email addresses are available yet.")
+    else:
+        try:
+            smtp = load_smtp_settings(pg)
+        except Exception:
+            smtp = {
+                "host": "",
+                "port": 0,
+                "security": "SSL",
+                "username": "",
+                "password": "",
+                "from_addr": "",
+            }
+
+        if not smtp["host"] or not smtp["port"] or not smtp["from_addr"] or not smtp["password"]:
+            st.info("Configure SMTP settings in Settings before sending mass email.")
+        else:
+            st.caption(
+                "Placeholders available: {first_name}, {last_name}, {full_name}, {tier}, "
+                "{next_billing_date}, {join_date}, {status}, {locker}, {email}, {phone}"
+            )
+
+            recipient_mode = st.radio(
+                "Recipients",
+                ["All members with email", "Select members"],
+                horizontal=True,
+                key="mass_email_recipient_mode",
+            )
+
+            recipient_pool = members_with_email
+            if recipient_mode == "Select members":
+                recipient_lookup = {str(m["id"]): m for m in members_with_email}
+                selected_ids = st.multiselect(
+                    "Choose members",
+                    options=list(recipient_lookup.keys()),
+                    format_func=lambda mid: member_email_label(recipient_lookup[mid]),
+                    key="mass_email_selected_ids",
+                )
+                recipient_pool = [recipient_lookup[mid] for mid in selected_ids]
+
+            subject = st.text_input("Subject", key="mass_email_subject")
+            body = st.text_area("Message", height=180, key="mass_email_body")
+            uploaded_files = st.file_uploader(
+                "Attach files (optional)",
+                accept_multiple_files=True,
+                key="mass_email_file_attachments",
+            )
+            uploaded_images = st.file_uploader(
+                "Attach images (optional)",
+                type=["png", "jpg", "jpeg", "gif", "webp", "bmp"],
+                accept_multiple_files=True,
+                key="mass_email_image_attachments",
+            )
+            inline_images_in_body = st.checkbox(
+                "Show uploaded images inline in email body",
+                value=False,
+                key="mass_email_inline_images_enabled",
+                help="When enabled, uploaded images appear inside the email body instead of as regular attachments.",
+            )
+
+            file_attachment_payloads: list[dict] = []
+            for upload in uploaded_files or []:
+                payload = upload.getvalue() if upload is not None else b""
+                if not payload:
+                    continue
+                file_attachment_payloads.append(
+                    {
+                        "filename": str(getattr(upload, "name", "attachment.bin") or "attachment.bin"),
+                        "mime_type": str(getattr(upload, "type", "") or ""),
+                        "content": payload,
+                    }
+                )
+
+            image_payloads: list[dict] = []
+            for upload in uploaded_images or []:
+                payload = upload.getvalue() if upload is not None else b""
+                if not payload:
+                    continue
+                image_payloads.append(
+                    {
+                        "filename": str(getattr(upload, "name", "image") or "image"),
+                        "mime_type": str(getattr(upload, "type", "") or ""),
+                        "content": payload,
+                    }
+                )
+
+            attachment_payloads: list[dict] = list(file_attachment_payloads)
+            inline_image_payloads: list[dict] = []
+            if inline_images_in_body:
+                inline_image_payloads = list(image_payloads)
+            else:
+                attachment_payloads.extend(image_payloads)
+
+            if attachment_payloads:
+                st.caption(f"{len(attachment_payloads)} file attachment(s) will be included with each email.")
+            if inline_image_payloads:
+                st.caption(f"{len(inline_image_payloads)} image(s) will be embedded in the email body.")
+
+            preview_member = None
+            if recipient_pool:
+                preview_lookup = {str(m["id"]): m for m in recipient_pool}
+                preview_default = list(preview_lookup.keys())[0]
+                preview_id = st.selectbox(
+                    "Preview as member",
+                    options=list(preview_lookup.keys()),
+                    index=0,
+                    format_func=lambda mid: member_email_label(preview_lookup[mid]),
+                    key="mass_email_preview_member_id",
+                )
+                preview_member = preview_lookup.get(preview_id) or preview_lookup.get(preview_default)
+
+            with st.expander("Email Preview", expanded=True):
+                if preview_member is None:
+                    st.info("Select at least one recipient to preview personalized content.")
+                else:
+                    preview_subject = format_email_template(subject, preview_member)
+                    preview_body = format_email_template(body, preview_member)
+                    st.write("Subject preview")
+                    st.code(preview_subject or "(empty)", language="text")
+                    st.write("Message preview")
+                    st.code(preview_body or "(empty)", language="text")
+
+                    if inline_image_payloads:
+                        st.write("Inline image preview")
+                        for img in inline_image_payloads:
+                            st.caption(str(img.get("filename") or "image"))
+                            st.image(img.get("content", b""), width="stretch")
+
+                    if attachment_payloads:
+                        st.write("Attachments")
+                        for attachment in attachment_payloads:
+                            st.caption(str(attachment.get("filename") or "attachment"))
+
+            action_test_col, action_send_col = st.columns(2)
+            send_test_clicked = action_test_col.button("Send Test To Myself")
+            if send_test_clicked:
+                fallback_preview_member = preview_member
+                if fallback_preview_member is None and members_with_email:
+                    fallback_preview_member = members_with_email[0]
+
+                test_subject = format_email_template(subject, fallback_preview_member or {})
+                test_body = format_email_template(body, fallback_preview_member or {})
+                test_to = str(smtp.get("from_addr") or smtp.get("username") or "").strip()
+
+                if not test_to:
+                    st.warning("SMTP sender email is missing. Set From email in Settings first.")
+                elif not test_subject.strip() or not test_body.strip():
+                    st.warning("Subject and message are required before sending a test.")
+                else:
+                    try:
+                        send_email(
+                            smtp["host"],
+                            int(smtp["port"]),
+                            smtp["username"],
+                            smtp["password"],
+                            test_to,
+                            test_subject,
+                            test_body,
+                            security=smtp["security"],
+                            from_addr=smtp["from_addr"],
+                            attachments=attachment_payloads,
+                            inline_images=inline_image_payloads,
+                        )
+                        st.success(f"Test email sent to {test_to}.")
+                    except Exception as exc:
+                        st.error(f"Test email failed: {exc}")
+
+            send_clicked = action_send_col.button("Send Mass Email", type="primary")
+            if send_clicked:
+                if not subject.strip() or not body.strip():
+                    st.warning("Subject and message are required.")
+                elif not recipient_pool:
+                    st.warning("Select at least one recipient.")
+                else:
+                    sent_count, failures = send_mass_member_email(
+                        smtp,
+                        recipient_pool,
+                        subject,
+                        body,
+                        attachments=attachment_payloads,
+                        inline_images=inline_image_payloads,
+                    )
+                    if sent_count:
+                        st.success(f"Sent {sent_count} email(s).")
+                    if failures:
+                        failure_text = ", ".join(f"{label}: {error}" for label, error in failures[:3])
+                        if len(failures) > 3:
+                            failure_text += f" (+{len(failures) - 3} more)"
+                        st.error(f"Some emails failed: {failure_text}")
+                    if sent_count and not failures:
+                        queue_widget_reset(
+                            {
+                                "mass_email_subject": "",
+                                "mass_email_body": "",
+                                "mass_email_selected_ids": [],
+                            },
+                            "pending_communications_widget_reset",
+                        )
+                        st.rerun()
+
+    st.divider()
+    if show_member_mass_text_section:
+        st.subheader("Mass Text Members")
+
+        try:
+            sms_cfg = load_sms_settings(pg)
+        except Exception:
+            sms_cfg = {
+                "provider": "twilio",
+                "account_sid": "",
+                "auth_token": "",
+                "from_number": "",
+                "default_country_code": "+1",
+            }
+
+        members_with_phone = []
+        for member in members:
+            sms_to = _phone_to_e164(member.get("phone", ""), sms_cfg.get("default_country_code", "+1"))
+            if sms_to:
+                row = dict(member)
+                row["_sms_to"] = sms_to
+                members_with_phone.append(row)
+
+        if not members_with_phone:
+            st.info("No members with valid phone numbers are available yet.")
+        else:
+            st.caption(
+                "Placeholders available: {first_name}, {last_name}, {full_name}, {tier}, "
+                "{next_billing_date}, {join_date}, {status}, {locker}, {email}, {phone}"
+            )
+
+            text_recipient_mode = st.radio(
+                "Text recipients",
+                ["All members with valid phones", "Select members"],
+                horizontal=True,
+                key="mass_text_recipient_mode",
+            )
+
+            text_recipient_pool = members_with_phone
+            if text_recipient_mode == "Select members":
+                text_lookup = {str(m["id"]): m for m in members_with_phone}
+                selected_text_ids = st.multiselect(
+                    "Choose text recipients",
+                    options=list(text_lookup.keys()),
+                    format_func=lambda mid: member_text_label(text_lookup[mid], text_lookup[mid].get("_sms_to", "")),
+                    key="mass_text_selected_ids",
+                )
+                text_recipient_pool = [text_lookup[mid] for mid in selected_text_ids]
+
+            text_body = st.text_area(
+                "Text message",
+                key="mass_text_body",
+                height=140,
+                help="Use placeholders to personalize outgoing Twilio text messages.",
+            )
+            st.caption(f"Estimated recipients: {len(text_recipient_pool)}")
+
+            twilio_ready = bool(sms_cfg.get("account_sid") and sms_cfg.get("auth_token") and sms_cfg.get("from_number"))
+            if not twilio_ready:
+                st.info("Twilio SMS config is optional. Set it in Settings only if you want one-click sending from this app.")
+
+            if st.button("Send Mass Text", type="primary", disabled=not twilio_ready):
+                if not text_body.strip():
+                    st.warning("Message is required.")
+                elif not text_recipient_pool:
+                    st.warning("Select at least one recipient.")
+                else:
+                    sent_count, failures = send_mass_member_text(sms_cfg, text_recipient_pool, text_body)
+                    if sent_count:
+                        st.success(f"Sent {sent_count} text message(s).")
+                    if failures:
+                        failure_text = ", ".join(f"{label}: {error}" for label, error in failures[:3])
+                        if len(failures) > 3:
+                            failure_text += f" (+{len(failures) - 3} more)"
+                        st.error(f"Some texts failed: {failure_text}")
+                    if sent_count and not failures:
+                        queue_widget_reset(
+                            {
+                                "mass_text_body": "",
+                                "mass_text_selected_ids": [],
+                            },
+                            "pending_communications_widget_reset",
+                        )
+                        st.rerun()
+    else:
+        st.subheader("Mass Text Members")
+        st.caption("Hidden from communications page. Enable it in Settings -> Display.")
+
+
+def page_communications(pg: SyncPostgrestClient):
+    st.header("Campaigns")
+
+    pending_comms_reset = st.session_state.pop("pending_communications_widget_reset", None)
+    if isinstance(pending_comms_reset, dict):
+        reset_widget_state(pending_comms_reset)
+
+    try:
+        members = fetch_members(pg)
+    except Exception as exc:
+        st.error(f"Failed to load members: {exc}")
+        return
+
+    if not members:
+        st.info("No members yet. Add members first, then use this page for mass email and text.")
+        return
+
+    st.caption("Send mass email and text campaigns from one place.")
+    show_member_mass_text_section = _bool_setting(get_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY), True)
+    render_member_communications_section(pg, members, show_member_mass_text_section)
 
 
 def get_pending_reminders(members: list, templates: dict) -> list:
@@ -5866,14 +6626,16 @@ def page_members(pg: SyncPostgrestClient):
             due_label = f"{m['next_billing_date']} ({days_left:+d}d)"
         except Exception:
             due_label = m.get("next_billing_date", "")
+        status_text = str(m.get("status", "")).strip()
         rows.append(
             {
                 "ID": m["id"],
                 "Name": f"{m['last_name']}, {m['first_name']}",
+                "Active Months": member_active_months(m, today),
                 "Email": m.get("email", ""),
                 "Phone": m.get("phone", ""),
                 "Tier": m.get("tier", ""),
-                "Status": m.get("status", ""),
+                "Status": status_text,
                 "Locker": m.get("locker", ""),
                 "Join Date": m.get("join_date", ""),
                 "Next Bill": due_label,
@@ -5883,13 +6645,155 @@ def page_members(pg: SyncPostgrestClient):
     st.dataframe(rows, width="stretch", hide_index=True)
 
     st.divider()
+    refill_title_col, refill_action_col = st.columns([3, 1])
+    with refill_title_col:
+        st.subheader("🎁 Gift Card Refills Due Today")
+    with refill_action_col:
+        if st.button(
+            "Backfill Missing Refill Dates",
+            key="gift_refill_backfill_btn",
+            help="Fix active monthly members missing a refill due date.",
+        ):
+            updated_count = backfill_missing_gift_card_refill_dates(pg)
+            if updated_count:
+                st.success(f"Backfilled {updated_count} member(s).")
+            else:
+                st.info("No missing refill dates found.")
+            st.rerun()
+    st.caption("Mark members as refilled after you complete their refills.")
+    
+    refill_due_members = fetch_gift_card_refill_due(pg)
+    
+    # Filter for today's refills
+    today_refills = []
+    for m in refill_due_members:
+        refill_date = m.get("calculated_refill_date") or m.get("next_gift_card_refill_date")
+        try:
+            if refill_date:
+                refill_dt = datetime.datetime.strptime(refill_date, "%Y-%m-%d").date()
+                if refill_dt <= today:
+                    today_refills.append(m)
+        except Exception:
+            pass
+    
+    # Sort by locker number
+    def get_locker_sort_key(member):
+        locker = str(member.get("locker", "")).strip()
+        if locker and locker != "—":
+            try:
+                return (0, int(locker))  # Numeric lockers come first, sorted numerically
+            except ValueError:
+                return (1, locker)  # Non-numeric lockers come after, sorted alphabetically
+        return (2, "")  # "—" comes last
+    
+    today_refills.sort(key=get_locker_sort_key)
+    
+    if not today_refills:
+        st.success("✓ No refills due today!")
+    else:
+        st.write(f"**{len(today_refills)} member(s) due for refill today:**")
+        
+        # Select All / Deselect All buttons
+        select_col1, select_col2 = st.columns(2)
+        with select_col1:
+            if st.button("Select All", use_container_width=True):
+                for m in today_refills:
+                    st.session_state[f"gift_refill_checkbox_{m['id']}"] = True
+                st.rerun()
+        with select_col2:
+            if st.button("Deselect All", use_container_width=True):
+                for m in today_refills:
+                    st.session_state[f"gift_refill_checkbox_{m['id']}"] = False
+                st.rerun()
+        
+        st.divider()
+        
+        # Display members with checkboxes
+        for m in today_refills:
+            member_id = m["id"]
+            member_display = f"{m['last_name']}, {m['first_name']} | Locker {m.get('locker', '—')} | {m.get('tier', '')} | Card: {m.get('gift_card_number', '—')}"
+            
+            st.checkbox(
+                member_display,
+                key=f"gift_refill_checkbox_{member_id}"
+            )
+        
+        st.divider()
+        
+        # Bulk refill button - get selected IDs from checkbox keys
+        selected_ids = [m["id"] for m in today_refills if st.session_state.get(f"gift_refill_checkbox_{m['id']}", False)]
+        
+        refill_col1, refill_col2, refill_col3 = st.columns(3)
+        with refill_col1:
+            refill_credit_today = st.number_input(
+                "Refill month credit",
+                min_value=1,
+                max_value=12,
+                value=1,
+                step=1,
+                key="gift_refill_today_credit_months",
+                help="Use 2 if this refill should count for two months.",
+            )
+            if st.button("✓ Mark Selected as Refilled", disabled=not selected_ids, type="primary", use_container_width=True):
+                success_count = 0
+                error_messages = []
+                for member_id in selected_ids:
+                    success, error = update_member_gift_card_refill_date(
+                        pg,
+                        member_id,
+                        str(today),
+                        credit_months=int(refill_credit_today),
+                    )
+                    if success:
+                        success_count += 1
+                    else:
+                        error_messages.append(f"Member {member_id}: {error}")
+                
+                if success_count > 0:
+                    st.success(f"✓ Marked {success_count} member(s) as refilled!")
+                    st.rerun()
+                
+                if error_messages:
+                    st.error("Errors: " + "; ".join(error_messages))
+        
+        with refill_col2:
+            if st.button("⊘ Skip Selected", disabled=not selected_ids, use_container_width=True):
+                success_count = 0
+                error_messages = []
+                for member_id in selected_ids:
+                    success, error = skip_member_gift_card_refill(pg, member_id)
+                    if success:
+                        success_count += 1
+                    else:
+                        error_messages.append(f"Member {member_id}: {error}")
+                
+                if success_count > 0:
+                    st.success(f"✓ Skipped {success_count} member(s)!")
+                    st.rerun()
+                
+                if error_messages:
+                    st.error("Errors: " + "; ".join(error_messages))
+        
+        with refill_col3:
+            if st.button("Clear Selection", use_container_width=True):
+                for m in today_refills:
+                    st.session_state[f"gift_refill_checkbox_{m['id']}"] = False
+                st.rerun()
+
+    st.divider()
     st.subheader("Monthly Gift Card Refill Tracker")
     st.caption("Track who received their monthly gift card so each member is only refilled once per month.")
 
     refill_month_options = []
     refill_rows_all = fetch_member_monthly_refills(pg)
+    refill_months_by_member: dict[str, int] = {}
     for row in refill_rows_all:
+        member_id_txt = str(row.get("member_id") or "").strip()
         mstart = str(row.get("month_start") or "").strip()
+        if member_id_txt and mstart:
+            refill_months_by_member[member_id_txt] = int(refill_months_by_member.get(member_id_txt, 0)) + parse_refill_credit_months(
+                str(row.get("notes") or "")
+            )
         if mstart and mstart not in refill_month_options:
             refill_month_options.append(mstart)
     current_refill_month = month_start_for()
@@ -5910,10 +6814,89 @@ def page_members(pg: SyncPostgrestClient):
         key="gift_refill_amount",
     )
     refill_note = st.text_input("Refill note (optional)", key="gift_refill_note")
+    refill_credit_months = st.number_input(
+        "Refill month credit",
+        min_value=1,
+        max_value=12,
+        value=1,
+        step=1,
+        key="gift_refill_credit_months",
+        help="Use 2 when one refill should count for two months.",
+    )
 
     refill_rows = fetch_member_monthly_refills(pg, month_start=refill_month)
     refill_map = {str(r.get("member_id")): r for r in refill_rows}
     active_members = [m for m in members if str(m.get("status") or "").strip().lower() == "active"]
+
+    st.divider()
+    st.subheader("Quick Member Editor")
+    st.caption("Click a member to jump into editing details and marking their renewal as paid.")
+
+    members_by_id = {str(m.get("id")): m for m in members}
+    if "member_actions_selected_id" not in st.session_state and members:
+        st.session_state["member_actions_selected_id"] = str(members[0].get("id"))
+
+    picker_col, filter_col = st.columns([1, 1])
+    with filter_col:
+        member_find = st.text_input(
+            "Find member",
+            key="member_action_find",
+            placeholder="Search name, locker, email, or phone",
+        ).strip().lower()
+
+    def _matches_member_filter(member: dict, query: str) -> bool:
+        if not query:
+            return True
+        full_name = f"{member.get('first_name', '')} {member.get('last_name', '')}".strip().lower()
+        reverse_name = f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", ").lower()
+        locker = str(member.get("locker") or "").strip().lower()
+        email = str(member.get("email") or "").strip().lower()
+        phone = str(member.get("phone") or "").strip().lower()
+        return query in full_name or query in reverse_name or query in locker or query in email or query in phone
+
+    filtered_member_ids = [
+        str(m.get("id"))
+        for m in members
+        if _matches_member_filter(m, member_find)
+    ]
+
+    if not filtered_member_ids:
+        st.info("No members match your search.")
+        filtered_member_ids = [str(m.get("id")) for m in members]
+
+    selected_member_id = str(st.session_state.get("member_actions_selected_id") or "")
+    if selected_member_id not in filtered_member_ids and filtered_member_ids:
+        selected_member_id = filtered_member_ids[0]
+        st.session_state["member_actions_selected_id"] = selected_member_id
+
+    with picker_col:
+        selected_member_id = st.selectbox(
+            "Selected member",
+            options=filtered_member_ids,
+            index=filtered_member_ids.index(selected_member_id) if selected_member_id in filtered_member_ids else 0,
+            format_func=lambda mid: (
+                f"{member_locker_label(members_by_id[mid])} | "
+                f"{members_by_id[mid].get('status', '')} | "
+                f"{member_active_months(members_by_id[mid], today)} mo"
+            ),
+            key="member_action_picker",
+        )
+        st.session_state["member_actions_selected_id"] = selected_member_id
+
+    quick_pick_ids = filtered_member_ids[:9]
+    if quick_pick_ids:
+        st.caption("Quick click:")
+        quick_cols = st.columns(3)
+        for idx, mid in enumerate(quick_pick_ids):
+            member = members_by_id[mid]
+            with quick_cols[idx % 3]:
+                if st.button(
+                    f"{member.get('last_name', '')}, {member.get('first_name', '')}",
+                    key=f"quick_pick_member_{mid}",
+                    width="stretch",
+                ):
+                    st.session_state["member_actions_selected_id"] = mid
+                    st.rerun()
 
     st.caption("Gift card number manager")
     card_member_options = {
@@ -5988,6 +6971,7 @@ def page_members(pg: SyncPostgrestClient):
                         month_start=refill_month,
                         amount=float(refill_amount),
                         notes=refill_note,
+                        credit_months=int(refill_credit_months),
                     )
                     if ok:
                         marked += 1
@@ -6021,6 +7005,7 @@ def page_members(pg: SyncPostgrestClient):
                     month_start=refill_month,
                     amount=float(refill_amount),
                     notes=refill_note,
+                    credit_months=int(refill_credit_months),
                 )
                 if ok:
                     marked += 1
@@ -6076,13 +7061,35 @@ def page_members(pg: SyncPostgrestClient):
                     st.rerun()
 
     tracker_rows = []
+    matched_count = 0
+    behind_count = 0
+    overfilled_count = 0
+    behind_members: list[tuple[str, int]] = []
     for member in sorted(active_members, key=_locker_sort_key):
         member_id = str(member.get("id"))
         refill = refill_map.get(member_id)
+        active_months_count = member_active_months(member, today)
+        refilled_months_count = int(refill_months_by_member.get(member_id, 0))
+        refill_delta = active_months_count - refilled_months_count
+        if refill_delta == 0:
+            refill_match = "Matched"
+            matched_count += 1
+        elif refill_delta > 0:
+            refill_match = f"Behind {refill_delta}"
+            behind_count += 1
+            behind_members.append((member_id, int(refill_delta)))
+        else:
+            refill_match = f"Overfilled {abs(refill_delta)}"
+            overfilled_count += 1
         tracker_rows.append(
             {
                 "Member": f"{member.get('last_name', '')}, {member.get('first_name', '')}",
                 "Locker": str(member.get("locker") or "").strip() or "—",
+                "Active Months": active_months_count,
+                "Refilled Months": refilled_months_count,
+                "Refill Delta": refill_delta,
+                "Refill Match": refill_match,
+                "Next Bill": str(member.get("next_billing_date") or ""),
                 "Gift Card #": str(member.get("gift_card_number") or ""),
                 "Refilled": "Yes" if refill else "No",
                 "Amount": float(refill.get("amount") or 0.0) if refill else 0.0,
@@ -6091,328 +7098,240 @@ def page_members(pg: SyncPostgrestClient):
             }
         )
 
-    st.dataframe(tracker_rows, width="stretch", hide_index=True)
+    rm1, rm2, rm3 = st.columns(3)
+    rm1.metric("Matched", matched_count)
+    rm2.metric("Behind", behind_count)
+    rm3.metric("Overfilled", overfilled_count)
 
-    st.divider()
-    st.subheader("Mass Email Members")
-
-    members_with_email = [m for m in members if str(m.get("email") or "").strip()]
-    if not members_with_email:
-        st.info("No members with email addresses are available yet.")
-    else:
-        try:
-            smtp = load_smtp_settings(pg)
-        except Exception:
-            smtp = {
-                "host": "",
-                "port": 0,
-                "security": "SSL",
-                "username": "",
-                "password": "",
-                "from_addr": "",
-            }
-
-        if not smtp["host"] or not smtp["port"] or not smtp["from_addr"] or not smtp["password"]:
-            st.info("Configure SMTP settings in Settings before sending mass email.")
-        else:
-            st.caption(
-                "Placeholders available: {first_name}, {last_name}, {full_name}, {tier}, "
-                "{next_billing_date}, {join_date}, {status}, {locker}, {email}, {phone}"
-            )
-
-            recipient_mode = st.radio(
-                "Recipients",
-                ["All members with email", "Select members"],
-                horizontal=True,
-                key="mass_email_recipient_mode",
-            )
-
-            recipient_pool = members_with_email
-            if recipient_mode == "Select members":
-                recipient_lookup = {str(m["id"]): m for m in members_with_email}
-                selected_ids = st.multiselect(
-                    "Choose members",
-                    options=list(recipient_lookup.keys()),
-                    format_func=lambda mid: member_email_label(recipient_lookup[mid]),
-                    key="mass_email_selected_ids",
-                )
-                recipient_pool = [recipient_lookup[mid] for mid in selected_ids]
-
-            subject = st.text_input("Subject", key="mass_email_subject")
-            body = st.text_area("Message", height=180, key="mass_email_body")
-
-            send_clicked = st.button("Send Mass Email", type="primary")
-            if send_clicked:
-                if not subject.strip() or not body.strip():
-                    st.warning("Subject and message are required.")
-                elif not recipient_pool:
-                    st.warning("Select at least one recipient.")
-                else:
-                    sent_count, failures = send_mass_member_email(
-                        smtp,
-                        recipient_pool,
-                        subject,
-                        body,
-                    )
-                    if sent_count:
-                        st.success(f"Sent {sent_count} email(s).")
-                    if failures:
-                        failure_text = ", ".join(f"{label}: {error}" for label, error in failures[:3])
-                        if len(failures) > 3:
-                            failure_text += f" (+{len(failures) - 3} more)"
-                        st.error(f"Some emails failed: {failure_text}")
-                    if sent_count and not failures:
-                        queue_widget_reset(
-                            {
-                                "mass_email_subject": "",
-                                "mass_email_body": "",
-                                "mass_email_selected_ids": [],
-                            },
-                            "pending_members_widget_reset",
-                        )
-                        st.rerun()
-
-    st.divider()
-    st.subheader("Mass Text Members")
-
-    try:
-        sms_cfg = load_sms_settings(pg)
-    except Exception:
-        sms_cfg = {
-            "provider": "twilio",
-            "account_sid": "",
-            "auth_token": "",
-            "from_number": "",
-            "default_country_code": "+1",
-        }
-
-    members_with_phone = []
-    for member in members:
-        sms_to = _phone_to_e164(member.get("phone", ""), sms_cfg.get("default_country_code", "+1"))
-        if sms_to:
-            row = dict(member)
-            row["_sms_to"] = sms_to
-            members_with_phone.append(row)
-
-    if not members_with_phone:
-        st.info("No members with valid phone numbers are available yet.")
-    else:
-        st.caption(
-            "Placeholders available: {first_name}, {last_name}, {full_name}, {tier}, "
-            "{next_billing_date}, {join_date}, {status}, {locker}, {email}, {phone}"
+    if behind_members:
+        total_missing_months = sum(delta for _, delta in behind_members)
+        st.warning(
+            f"{behind_count} member(s) are behind by {total_missing_months} total month(s). "
+            f"Use the catch-up action below if these are historical credits already given."
         )
-
-        text_recipient_mode = st.radio(
-            "Text recipients",
-            ["All members with valid phones", "Select members"],
-            horizontal=True,
-            key="mass_text_recipient_mode",
-        )
-
-        text_recipient_pool = members_with_phone
-        if text_recipient_mode == "Select members":
-            text_lookup = {str(m["id"]): m for m in members_with_phone}
-            selected_text_ids = st.multiselect(
-                "Choose text recipients",
-                options=list(text_lookup.keys()),
-                format_func=lambda mid: member_text_label(text_lookup[mid], text_lookup[mid].get("_sms_to", "")),
-                key="mass_text_selected_ids",
-            )
-            text_recipient_pool = [text_lookup[mid] for mid in selected_text_ids]
-
-        text_body = st.text_area(
-            "Text message",
-            key="mass_text_body",
-            height=140,
-            help="Use placeholders to personalize outgoing Twilio text messages.",
-        )
-        st.caption(f"Estimated recipients: {len(text_recipient_pool)}")
-
-        twilio_ready = bool(sms_cfg.get("account_sid") and sms_cfg.get("auth_token") and sms_cfg.get("from_number"))
-        if not twilio_ready:
-            st.info("Twilio SMS config is optional. Set it in Settings only if you want one-click sending from this app.")
-
-        if st.button("Send Mass Text", type="primary", disabled=not twilio_ready):
-            if not text_body.strip():
-                st.warning("Message is required.")
-            elif not text_recipient_pool:
-                st.warning("Select at least one recipient.")
-            else:
-                sent_count, failures = send_mass_member_text(sms_cfg, text_recipient_pool, text_body)
-                if sent_count:
-                    st.success(f"Sent {sent_count} text message(s).")
-                if failures:
-                    failure_text = ", ".join(f"{label}: {error}" for label, error in failures[:3])
-                    if len(failures) > 3:
-                        failure_text += f" (+{len(failures) - 3} more)"
-                    st.error(f"Some texts failed: {failure_text}")
-                if sent_count and not failures:
-                    queue_widget_reset(
-                        {
-                            "mass_text_body": "",
-                            "mass_text_selected_ids": [],
-                        },
-                        "pending_members_widget_reset",
-                    )
-                    st.rerun()
-
-    st.divider()
-    st.subheader("Drink Tracker")
-    month_options = []
-    month_rows_all = fetch_member_monthly_drinks(pg)
-    for r in month_rows_all:
-        mstart = str(r.get("month_start") or "").strip()
-        if mstart and mstart not in month_options:
-            month_options.append(mstart)
-    current_month = month_start_for()
-    if current_month not in month_options:
-        month_options.insert(0, current_month)
-    month_labels = {m: month_label(m) for m in month_options}
-    selected_month = st.selectbox(
-        "Overview month",
-        month_options,
-        format_func=lambda x: month_labels.get(x, x),
-        key="member_drink_overview_month",
-    )
-
-    selected_month_rows = fetch_member_monthly_drinks(pg, month_start=selected_month)
-    by_id = {str(m.get("id")): m for m in members}
-    overview_rows = []
-    export_month_rows = []
-    total_alc = 0
-    total_non_alc = 0
-    total_drinks = 0
-    for r in selected_month_rows:
-        mid = str(r.get("member_id"))
-        member = by_id.get(mid, {})
-        alc = int(r.get("alcoholic_drinks") or 0)
-        non_alc = int(r.get("non_alcoholic_drinks") or 0)
-        tot = int(r.get("total_drinks") or (alc + non_alc))
-        total_alc += alc
-        total_non_alc += non_alc
-        total_drinks += tot
-        overview_rows.append(
-            {
-                "Member": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
-                "Alcoholic": alc,
-                "Non-Alcoholic": non_alc,
-                "Total": tot,
-            }
-        )
-        export_month_rows.append(
-            {
-                "month_start": selected_month,
-                "month_label": month_labels.get(selected_month, selected_month),
-                "member_id": mid,
-                "member_name": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
-                "alcoholic_drinks": alc,
-                "non_alcoholic_drinks": non_alc,
-                "total_drinks": tot,
-            }
-        )
-
-    k1, k2, k3 = st.columns(3)
-    k1.metric(f"Alcoholic ({month_labels.get(selected_month, selected_month)})", total_alc)
-    k2.metric(f"Non-Alcoholic ({month_labels.get(selected_month, selected_month)})", total_non_alc)
-    k3.metric(f"Total ({month_labels.get(selected_month, selected_month)})", total_drinks)
-
-    month_download_name = (
-        f"member_drinks_{selected_month}_{datetime.date.today().strftime('%Y%m%d')}.csv"
-    )
-    month_export_text = ""
-    if export_month_rows:
-        month_export_buf = io.StringIO()
-        month_writer = csv.DictWriter(
-            month_export_buf,
-            fieldnames=[
-                "month_start",
-                "month_label",
-                "member_id",
-                "member_name",
-                "alcoholic_drinks",
-                "non_alcoholic_drinks",
-                "total_drinks",
-            ],
-        )
-        month_writer.writeheader()
-        for row in sorted(export_month_rows, key=lambda x: x["total_drinks"], reverse=True):
-            month_writer.writerow(row)
-        month_export_text = month_export_buf.getvalue()
-
-    all_export_rows = []
-    for r in month_rows_all:
-        mstart = str(r.get("month_start") or "")
-        mid = str(r.get("member_id") or "")
-        member = by_id.get(mid, {})
-        alc = int(r.get("alcoholic_drinks") or 0)
-        non_alc = int(r.get("non_alcoholic_drinks") or 0)
-        tot = int(r.get("total_drinks") or (alc + non_alc))
-        all_export_rows.append(
-            {
-                "month_start": mstart,
-                "month_label": month_label(mstart),
-                "member_id": mid,
-                "member_name": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
-                "alcoholic_drinks": alc,
-                "non_alcoholic_drinks": non_alc,
-                "total_drinks": tot,
-            }
-        )
-
-    all_download_name = f"member_drinks_all_months_{datetime.date.today().strftime('%Y%m%d')}.csv"
-    all_export_text = ""
-    if all_export_rows:
-        all_export_buf = io.StringIO()
-        all_writer = csv.DictWriter(
-            all_export_buf,
-            fieldnames=[
-                "month_start",
-                "month_label",
-                "member_id",
-                "member_name",
-                "alcoholic_drinks",
-                "non_alcoholic_drinks",
-                "total_drinks",
-            ],
-        )
-        all_writer.writeheader()
-        for row in sorted(
-            all_export_rows,
-            key=lambda x: (x["month_start"], x["total_drinks"]),
-            reverse=True,
+        if st.button(
+            "Apply Catch-Up Credits (Tracking Only)",
+            key="gift_refill_apply_catchup_btn",
+            help="Adds missing month credits to the selected refill month without adding card value.",
         ):
-            all_writer.writerow(row)
-        all_export_text = all_export_buf.getvalue()
+            adjusted = 0
+            failures = []
+            for member_id, delta in behind_members:
+                ok, err = apply_refill_credit_adjustment(
+                    pg,
+                    member_id,
+                    delta,
+                    month_start=refill_month,
+                )
+                if ok:
+                    adjusted += 1
+                else:
+                    failures.append(f"{member_id}: {err}")
 
-    d1, d2 = st.columns(2)
-    d1.download_button(
-        "Download Selected Month CSV",
-        data=month_export_text,
-        file_name=month_download_name,
-        mime="text/csv",
-        disabled=not bool(month_export_text),
-        width="stretch",
-    )
-    d2.download_button(
-        "Download All Months CSV",
-        data=all_export_text,
-        file_name=all_download_name,
-        mime="text/csv",
-        disabled=not bool(all_export_text),
-        width="stretch",
-    )
+            if adjusted:
+                st.success(f"Applied catch-up credits for {adjusted} member(s) in {month_label(refill_month)}.")
+            if failures:
+                st.error("Some catch-up adjustments failed: " + "; ".join(failures[:3]))
+            st.rerun()
 
-    if overview_rows:
-        st.dataframe(
-            sorted(overview_rows, key=lambda x: x["Total"], reverse=True),
-            width="stretch",
-            hide_index=True,
-        )
+    if tracker_rows:
+        tracker_df = pd.DataFrame(tracker_rows)
+
+        def _style_refill_match(value):
+            label = str(value or "")
+            if label.startswith("Matched"):
+                return "background-color: #eaf8ef; color: #1b7f3a; font-weight: 600;"
+            if label.startswith("Behind"):
+                return "background-color: #fff7e8; color: #9a6700; font-weight: 600;"
+            if label.startswith("Overfilled"):
+                return "background-color: #ffeef0; color: #b42318; font-weight: 600;"
+            return ""
+
+        def _style_refill_delta(value):
+            try:
+                delta = int(value)
+            except Exception:
+                return ""
+            if delta == 0:
+                return "background-color: #eaf8ef; color: #1b7f3a; font-weight: 600;"
+            if delta > 0:
+                return "background-color: #fff7e8; color: #9a6700; font-weight: 600;"
+            return "background-color: #ffeef0; color: #b42318; font-weight: 600;"
+
+        styled_tracker_df = tracker_df.style
+        styled_tracker_df = styled_tracker_df.map(_style_refill_match, subset=["Refill Match"])
+        styled_tracker_df = styled_tracker_df.map(_style_refill_delta, subset=["Refill Delta"])
+        st.dataframe(styled_tracker_df, width="stretch", hide_index=True)
     else:
-        st.info("No drink history for this month yet.")
+        st.dataframe(tracker_rows, width="stretch", hide_index=True)
 
     st.divider()
-    show_member_margin_section = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), True)
+    st.subheader("Communications")
+    st.caption("Mass email and text tools moved to the Campaigns page in the sidebar.")
+
+    by_id = {str(m.get("id")): m for m in members}
+    current_month = month_start_for()
+
+    st.divider()
+    show_member_drink_tracker_section = _bool_setting(get_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY), False)
+    if show_member_drink_tracker_section:
+        st.subheader("Drink Tracker")
+        month_options = []
+        month_rows_all = fetch_member_monthly_drinks(pg)
+        for r in month_rows_all:
+            mstart = str(r.get("month_start") or "").strip()
+            if mstart and mstart not in month_options:
+                month_options.append(mstart)
+        if current_month not in month_options:
+            month_options.insert(0, current_month)
+        month_labels = {m: month_label(m) for m in month_options}
+        selected_month = st.selectbox(
+            "Overview month",
+            month_options,
+            format_func=lambda x: month_labels.get(x, x),
+            key="member_drink_overview_month",
+        )
+
+        selected_month_rows = fetch_member_monthly_drinks(pg, month_start=selected_month)
+        overview_rows = []
+        export_month_rows = []
+        total_alc = 0
+        total_non_alc = 0
+        total_drinks = 0
+        for r in selected_month_rows:
+            mid = str(r.get("member_id"))
+            member = by_id.get(mid, {})
+            alc = int(r.get("alcoholic_drinks") or 0)
+            non_alc = int(r.get("non_alcoholic_drinks") or 0)
+            tot = int(r.get("total_drinks") or (alc + non_alc))
+            total_alc += alc
+            total_non_alc += non_alc
+            total_drinks += tot
+            overview_rows.append(
+                {
+                    "Member": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
+                    "Alcoholic": alc,
+                    "Non-Alcoholic": non_alc,
+                    "Total": tot,
+                }
+            )
+            export_month_rows.append(
+                {
+                    "month_start": selected_month,
+                    "month_label": month_labels.get(selected_month, selected_month),
+                    "member_id": mid,
+                    "member_name": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
+                    "alcoholic_drinks": alc,
+                    "non_alcoholic_drinks": non_alc,
+                    "total_drinks": tot,
+                }
+            )
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric(f"Alcoholic ({month_labels.get(selected_month, selected_month)})", total_alc)
+        k2.metric(f"Non-Alcoholic ({month_labels.get(selected_month, selected_month)})", total_non_alc)
+        k3.metric(f"Total ({month_labels.get(selected_month, selected_month)})", total_drinks)
+
+        month_download_name = (
+            f"member_drinks_{selected_month}_{datetime.date.today().strftime('%Y%m%d')}.csv"
+        )
+        month_export_text = ""
+        if export_month_rows:
+            month_export_buf = io.StringIO()
+            month_writer = csv.DictWriter(
+                month_export_buf,
+                fieldnames=[
+                    "month_start",
+                    "month_label",
+                    "member_id",
+                    "member_name",
+                    "alcoholic_drinks",
+                    "non_alcoholic_drinks",
+                    "total_drinks",
+                ],
+            )
+            month_writer.writeheader()
+            for row in sorted(export_month_rows, key=lambda x: x["total_drinks"], reverse=True):
+                month_writer.writerow(row)
+            month_export_text = month_export_buf.getvalue()
+
+        all_export_rows = []
+        for r in month_rows_all:
+            mstart = str(r.get("month_start") or "")
+            mid = str(r.get("member_id") or "")
+            member = by_id.get(mid, {})
+            alc = int(r.get("alcoholic_drinks") or 0)
+            non_alc = int(r.get("non_alcoholic_drinks") or 0)
+            tot = int(r.get("total_drinks") or (alc + non_alc))
+            all_export_rows.append(
+                {
+                    "month_start": mstart,
+                    "month_label": month_label(mstart),
+                    "member_id": mid,
+                    "member_name": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
+                    "alcoholic_drinks": alc,
+                    "non_alcoholic_drinks": non_alc,
+                    "total_drinks": tot,
+                }
+            )
+
+        all_download_name = f"member_drinks_all_months_{datetime.date.today().strftime('%Y%m%d')}.csv"
+        all_export_text = ""
+        if all_export_rows:
+            all_export_buf = io.StringIO()
+            all_writer = csv.DictWriter(
+                all_export_buf,
+                fieldnames=[
+                    "month_start",
+                    "month_label",
+                    "member_id",
+                    "member_name",
+                    "alcoholic_drinks",
+                    "non_alcoholic_drinks",
+                    "total_drinks",
+                ],
+            )
+            all_writer.writeheader()
+            for row in sorted(
+                all_export_rows,
+                key=lambda x: (x["month_start"], x["total_drinks"]),
+                reverse=True,
+            ):
+                all_writer.writerow(row)
+            all_export_text = all_export_buf.getvalue()
+
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "Download Selected Month CSV",
+            data=month_export_text,
+            file_name=month_download_name,
+            mime="text/csv",
+            disabled=not bool(month_export_text),
+            width="stretch",
+        )
+        d2.download_button(
+            "Download All Months CSV",
+            data=all_export_text,
+            file_name=all_download_name,
+            mime="text/csv",
+            disabled=not bool(all_export_text),
+            width="stretch",
+        )
+
+        if overview_rows:
+            st.dataframe(
+                sorted(overview_rows, key=lambda x: x["Total"], reverse=True),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("No drink history for this month yet.")
+    else:
+        st.subheader("Drink Tracker")
+        st.caption("Hidden. Enable it in Settings -> Display.")
+
+    st.divider()
+    show_member_margin_section = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), False)
     if show_member_margin_section:
         render_member_purchase_margins(sales, loyalty_customers, by_id, current_month)
     else:
@@ -6420,11 +7339,16 @@ def page_members(pg: SyncPostgrestClient):
         st.caption("Hidden. Enable it in Settings -> Display.")
 
     st.divider()
-    member_options = {
-        f"{m['last_name']}, {m['first_name']} (ID {m['id']})": m for m in members
-    }
-    selected_label = st.selectbox("Select member for actions", list(member_options.keys()))
-    selected = member_options[selected_label]
+    st.subheader("Selected Member Actions")
+    selected = members_by_id.get(str(st.session_state.get("member_actions_selected_id")))
+    if not selected:
+        selected = members[0]
+        st.session_state["member_actions_selected_id"] = str(selected.get("id"))
+
+    st.caption(
+        f"Editing {selected.get('first_name', '')} {selected.get('last_name', '')} | "
+        f"Active for {member_active_months(selected, today)} month(s)"
+    )
 
     selected_history = fetch_member_monthly_drinks(pg, member_id=selected["id"])
     if selected_history:
@@ -6471,15 +7395,21 @@ def page_members(pg: SyncPostgrestClient):
 
     with col_pay:
         pay_months = st.number_input(
-            "Months to pay", min_value=1, max_value=12, value=1, step=1, key="pay_months"
+            "Renewal periods paid",
+            min_value=1,
+            max_value=12,
+            value=1,
+            step=1,
+            key="pay_months",
+            help="For monthly plans use 1 for a normal monthly renewal. For annual plans use 1 for one full year.",
         )
-        if st.button("Process Payment", type="primary"):
+        if st.button("Mark Renewal Paid", type="primary"):
             try:
                 process_payment(
                     pg, selected["id"], selected["tier"],
                     selected["next_billing_date"], int(pay_months)
                 )
-                st.success("Payment processed.")
+                st.success("Renewal saved and next billing date updated.")
                 st.rerun()
             except Exception as exc:
                 st.error(f"Failed: {exc}")
@@ -6488,6 +7418,7 @@ def page_members(pg: SyncPostgrestClient):
         with st.expander("Edit member"):
             mid = selected["id"]
             status_opts = ["Active", "Past Due", "Inactive", "Canceled"]
+            tier_opts = ["Annual", "Monthly"]
             e_fn = st.text_input("First Name", value=selected["first_name"], key=f"e_fn_{mid}")
             e_ln = st.text_input("Last Name", value=selected["last_name"], key=f"e_ln_{mid}")
             e_em = st.text_input("Email", value=selected.get("email", ""), key=f"e_em_{mid}")
@@ -6498,6 +7429,12 @@ def page_members(pg: SyncPostgrestClient):
                 "Status", status_opts,
                 index=status_opts.index(_cur_status) if _cur_status in status_opts else 0,
                 key=f"e_st_{mid}",
+            )
+            _cur_tier = selected.get("tier", "Annual")
+            e_tier = st.selectbox(
+                "Tier", tier_opts,
+                index=tier_opts.index(_cur_tier) if _cur_tier in tier_opts else 0,
+                key=f"e_tier_{mid}",
             )
             if st.button("Save Changes", key=f"save_member_{mid}"):
                 try:
@@ -6510,8 +7447,9 @@ def page_members(pg: SyncPostgrestClient):
                         "phone": selected.get("phone", ""),
                         "locker": selected.get("locker", ""),
                         "status": selected.get("status", "Active"),
+                        "tier": selected.get("tier", "Annual"),
                     }
-                    update_member(pg, selected["id"], e_fn, e_ln, e_em, e_ph, e_lk, e_st)
+                    update_member(pg, selected["id"], e_fn, e_ln, e_em, e_ph, e_lk, e_st, e_tier)
                     undo_stack.append(prev_snapshot)
                     if len(undo_stack) > MAX_MEMBER_EDIT_UNDO:
                         del undo_stack[:-MAX_MEMBER_EDIT_UNDO]
@@ -6541,6 +7479,7 @@ def page_members(pg: SyncPostgrestClient):
                             "Phone": snap.get("phone", ""),
                             "Locker": snap.get("locker", ""),
                             "Status": snap.get("status", "Active"),
+                            "Tier": snap.get("tier", "Annual"),
                         }
                     )
                 st.caption("Recent undo snapshots (newest first)")
@@ -6724,6 +7663,11 @@ def page_sales_ledger(pg: SyncPostgrestClient):
         "Track each day's cash sales, credit sales, cash taken out, and final cash deposit in one place."
     )
 
+    # Remove stale weekend split settings from prior versions.
+    for legacy_key in ("sales_ledger_weekend_start_day_v1", "sales_ledger_weekend_end_day_v1"):
+        if str(get_setting(pg, legacy_key) or "").strip():
+            clear_setting(pg, legacy_key)
+
     pending_ledger_reset = st.session_state.pop("_sales_ledger_pending_reset", None)
     if isinstance(pending_ledger_reset, dict):
         reset_widget_state(pending_ledger_reset)
@@ -6777,41 +7721,6 @@ def page_sales_ledger(pg: SyncPostgrestClient):
         row for row in merged_rows if ledger_month_start(str(row.get("sale_date") or "")) == selected_month
     ]
 
-    if not str(get_setting(pg, SALES_LEDGER_WEEKEND_START_KEY) or "").strip():
-        save_setting(pg, SALES_LEDGER_WEEKEND_START_KEY, "Friday")
-    if not str(get_setting(pg, SALES_LEDGER_WEEKEND_END_KEY) or "").strip():
-        save_setting(pg, SALES_LEDGER_WEEKEND_END_KEY, "Sunday")
-
-    weekend_start_day = _normalize_weekday_name(
-        st.session_state.get(
-            "sales_ledger_weekend_start_day",
-            get_setting(pg, SALES_LEDGER_WEEKEND_START_KEY) or "Friday",
-        )
-    )
-    weekend_end_day = _normalize_weekday_name(
-        st.session_state.get(
-            "sales_ledger_weekend_end_day",
-            get_setting(pg, SALES_LEDGER_WEEKEND_END_KEY) or "Sunday",
-        ),
-        "Sunday",
-    )
-    weekend_day_indices = _weekday_range_indices(weekend_start_day, weekend_end_day)
-
-    def _is_weekend_row(row: dict) -> bool:
-        sale_date_text = str(row.get("sale_date") or "").strip()
-        if not sale_date_text:
-            return False
-        try:
-            sale_day_index = datetime.datetime.strptime(sale_date_text, "%Y-%m-%d").date().weekday()
-        except Exception:
-            return False
-        return sale_day_index in weekend_day_indices
-
-    selected_month_weekend_closed_register_withdrawn = round(
-        sum(float(row.get("closed_register_withdrawn") or 0.0) for row in selected_rows if _is_weekend_row(row)),
-        2,
-    )
-
     total_cash_sales = round(sum(float(row.get("cash_sales") or 0.0) for row in selected_rows), 2)
     total_credit_sales = round(sum(float(row.get("credit_sales") or 0.0) for row in selected_rows), 2)
     total_cash_taken = round(sum(float(row.get("cash_taken") or 0.0) for row in selected_rows), 2)
@@ -6823,116 +7732,13 @@ def page_sales_ledger(pg: SyncPostgrestClient):
     expected_deposit_total = round(total_cash_sales - total_cash_taken, 2)
     deposit_variance_total = round(total_cash_deposit - expected_deposit_total, 2)
 
-    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Cash Sales", f"${total_cash_sales:,.2f}")
     m2.metric("Credit Sales", f"${total_credit_sales:,.2f}")
     m3.metric("Cash Taken", f"${total_cash_taken:,.2f}")
     m4.metric("Cash Deposited", f"${total_cash_deposit:,.2f}")
     m5.metric("Deposit Variance", f"${deposit_variance_total:,.2f}")
     m6.metric("Pulled From Closed", f"${total_closed_register_withdrawn:,.2f}")
-    m7.metric("Weekend Pulls", f"${selected_month_weekend_closed_register_withdrawn:,.2f}")
-
-    with st.expander("Weekend Register Settings", expanded=False):
-        c_start, c_end = st.columns(2)
-        weekend_start_day = c_start.selectbox(
-            "Weekend start day",
-            WEEKDAY_OPTIONS,
-            index=WEEKDAY_OPTIONS.index(weekend_start_day),
-            key="sales_ledger_weekend_start_day",
-        )
-        weekend_end_day = c_end.selectbox(
-            "Weekend end day",
-            WEEKDAY_OPTIONS,
-            index=WEEKDAY_OPTIONS.index(weekend_end_day),
-            key="sales_ledger_weekend_end_day",
-        )
-        save_setting(pg, SALES_LEDGER_WEEKEND_START_KEY, weekend_start_day)
-        save_setting(pg, SALES_LEDGER_WEEKEND_END_KEY, weekend_end_day)
-        st.caption(f"Weekend register is currently set to {_weekday_label(weekend_start_day, weekend_end_day)}.")
-
-    weekend_rows = [row for row in selected_rows if _is_weekend_row(row)]
-
-    weekend_cash_sales = round(sum(float(row.get("cash_sales") or 0.0) for row in weekend_rows), 2)
-    weekend_credit_sales = round(sum(float(row.get("credit_sales") or 0.0) for row in weekend_rows), 2)
-    weekend_cash_taken = round(sum(float(row.get("cash_taken") or 0.0) for row in weekend_rows), 2)
-    weekend_cash_deposit = round(sum(float(row.get("cash_deposit") or 0.0) for row in weekend_rows), 2)
-    weekend_closed_register_withdrawn = round(
-        sum(float(row.get("closed_register_withdrawn") or 0.0) for row in weekend_rows),
-        2,
-    )
-    weekend_expected_deposit = round(weekend_cash_sales - weekend_cash_taken, 2)
-    weekend_deposit_variance = round(weekend_cash_deposit - weekend_expected_deposit, 2)
-
-    st.subheader(f"Weekend Register ({_weekday_label(weekend_start_day, weekend_end_day)})")
-    ww1, ww2, ww3, ww4, ww5 = st.columns(5)
-    ww1.metric("Cash Sales", f"${weekend_cash_sales:,.2f}")
-    ww2.metric("Credit Sales", f"${weekend_credit_sales:,.2f}")
-    ww3.metric("Cash Taken", f"${weekend_cash_taken:,.2f}")
-    ww4.metric("Cash Deposited", f"${weekend_cash_deposit:,.2f}")
-    ww5.metric("Variance", f"${weekend_deposit_variance:,.2f}")
-    st.caption(
-        f"Weekend rows in {month_label(selected_month)}: {len(weekend_rows)} day(s) | Pulled from closed registers: ${weekend_closed_register_withdrawn:,.2f}"
-    )
-    if weekend_rows:
-        weekend_display_rows = [build_daily_ledger_display_row(row) for row in sorted(weekend_rows, key=lambda value: str(value.get("sale_date") or ""), reverse=True)]
-        st.dataframe(weekend_display_rows, width="stretch", hide_index=True)
-
-        weekend_export_buffer = io.StringIO()
-        weekend_writer = csv.DictWriter(
-            weekend_export_buffer,
-            fieldnames=[
-                "Date",
-                "Cash Sales",
-                "Credit Sales",
-                "Total Sales",
-                "Cash Taken",
-                "Deduction Count",
-                "Expected Deposit",
-                "Cash Deposited",
-                "Closed Register Withdrawn",
-                "Remaining Closed Cash",
-                "Deposit Variance",
-                "Notes",
-                "Updated",
-            ],
-        )
-        weekend_writer.writeheader()
-        for row in weekend_display_rows:
-            weekend_writer.writerow(row)
-
-        weekend_print_totals = {
-            "cash_sales": weekend_cash_sales,
-            "credit_sales": weekend_credit_sales,
-            "total_sales": weekend_cash_sales + weekend_credit_sales,
-            "cash_taken": weekend_cash_taken,
-            "cash_deposited": weekend_cash_deposit,
-            "deposit_variance": weekend_deposit_variance,
-        }
-        weekend_print_html = build_monthly_ledger_print_html(
-            f"Weekend Register - {_weekday_label(weekend_start_day, weekend_end_day)}",
-            weekend_display_rows,
-            weekend_print_totals,
-        )
-
-        wexp1, wexp2 = st.columns(2)
-        wexp1.download_button(
-            "Download Weekend CSV",
-            data=weekend_export_buffer.getvalue(),
-            file_name=f"daily_sales_weekend_{selected_month}_{datetime.date.today().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        wexp2.download_button(
-            "Download Weekend Printable HTML",
-            data=weekend_print_html,
-            file_name=f"daily_sales_weekend_print_{selected_month}_{datetime.date.today().strftime('%Y%m%d')}.html",
-            mime="text/html",
-            width="stretch",
-        )
-        if st.button("Open Weekend Print Preview", key=f"weekend_ledger_print_preview_{selected_month}"):
-            components.html(weekend_print_html, height=900, scrolling=True)
-    else:
-        st.info(f"No ledger entries fall within the selected {_weekday_label(weekend_start_day, weekend_end_day)} range for this month.")
 
     entry_date = st.date_input(
         "Ledger date",
@@ -8896,7 +9702,9 @@ def page_settings(pg: SyncPostgrestClient):
         st.caption("Sidebar navigation visibility")
         prev_show_pos = bool(st.session_state.get("show_pos_nav", True))
         prev_show_scanner = bool(st.session_state.get("show_scanner_nav", True))
-        prev_show_member_margin = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), True)
+        prev_show_member_margin = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), False)
+        prev_show_member_drink_tracker = _bool_setting(get_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY), False)
+        prev_show_member_mass_text = _bool_setting(get_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY), True)
         cfg_show_pos = st.checkbox(
             "Show POS in sidebar",
             value=prev_show_pos,
@@ -8912,14 +9720,28 @@ def page_settings(pg: SyncPostgrestClient):
             value=prev_show_member_margin,
             key="cfg_show_member_margin",
         )
+        cfg_show_member_drink_tracker = st.checkbox(
+            "Show Drink Tracker in Members page",
+            value=prev_show_member_drink_tracker,
+            key="cfg_show_member_drink_tracker",
+        )
+        cfg_show_member_mass_text = st.checkbox(
+            "Show Mass Text section in Members page",
+            value=prev_show_member_mass_text,
+            key="cfg_show_member_mass_text",
+        )
         if (
             cfg_show_pos != prev_show_pos
             or cfg_show_scanner != prev_show_scanner
             or cfg_show_member_margin != prev_show_member_margin
+            or cfg_show_member_drink_tracker != prev_show_member_drink_tracker
+            or cfg_show_member_mass_text != prev_show_member_mass_text
         ):
             save_setting(pg, NAV_SHOW_POS_KEY, "1" if cfg_show_pos else "0")
             save_setting(pg, NAV_SHOW_SCANNER_KEY, "1" if cfg_show_scanner else "0")
             save_setting(pg, MEMBER_MARGIN_SECTION_KEY, "1" if cfg_show_member_margin else "0")
+            save_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY, "1" if cfg_show_member_drink_tracker else "0")
+            save_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY, "1" if cfg_show_member_mass_text else "0")
             st.session_state["show_pos_nav"] = bool(cfg_show_pos)
             st.session_state["show_scanner_nav"] = bool(cfg_show_scanner)
             st.rerun()
@@ -9734,7 +10556,7 @@ def main():
         show_pos_nav = bool(st.session_state.get("show_pos_nav", True))
         show_scanner_nav = bool(st.session_state.get("show_scanner_nav", True))
 
-        nav_pages = ["Seats", "Members", "Sales Ledger", "Schedule", "Ordering"]
+        nav_pages = ["Seats", "Members", "Campaigns", "Sales Ledger", "Schedule", "Ordering"]
         if show_pos_nav:
             nav_pages.append("POS")
         if show_scanner_nav:
@@ -9753,6 +10575,8 @@ def main():
         page_seats(pg)
     elif page == "Members":
         page_members(pg)
+    elif page == "Campaigns":
+        page_communications(pg)
     elif page == "Sales Ledger":
         page_sales_ledger(pg)
     elif page == "Schedule":
