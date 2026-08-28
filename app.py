@@ -24,7 +24,7 @@ from postgrest import SyncPostgrestClient
 import streamlit.components.v1 as components
 from streamlit.errors import StreamlitAPIException
 
-st.set_page_config(page_title="Liberty Smokes", page_icon="🪑", layout="wide")
+st.set_page_config(page_title="Liberty Smokes", page_icon="logo.png", layout="wide")
 
 
 def get_sidebar_logo_path() -> Path | None:
