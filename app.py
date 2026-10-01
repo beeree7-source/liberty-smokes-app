@@ -6,6 +6,7 @@ import hashlib
 import html
 import io
 import importlib
+import imaplib
 import json
 import mimetypes
 import re
@@ -13,9 +14,11 @@ import socket
 from pathlib import Path
 import smtplib
 import uuid
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from email.utils import parseaddr
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
 import streamlit as st
@@ -1990,6 +1993,22 @@ POS_LOYALTY_POINTS_KEY = "pos_loyalty_points_v1"
 POS_LOYALTY_CUSTOMERS_KEY = "pos_loyalty_customers_v1"
 NAV_SHOW_POS_KEY = "nav_show_pos_v1"
 NAV_SHOW_SCANNER_KEY = "nav_show_scanner_v1"
+NAV_SHOW_SEATS_KEY = "nav_show_seats_v1"
+NAV_SHOW_MEMBERS_KEY = "nav_show_members_v1"
+NAV_SHOW_CAMPAIGNS_KEY = "nav_show_campaigns_v1"
+NAV_SHOW_SALES_LEDGER_KEY = "nav_show_sales_ledger_v1"
+NAV_SHOW_SCHEDULE_KEY = "nav_show_schedule_v1"
+NAV_SHOW_ORDERING_KEY = "nav_show_ordering_v1"
+NAV_PAGE_SETTING_KEYS = {
+    "Seats": NAV_SHOW_SEATS_KEY,
+    "Members": NAV_SHOW_MEMBERS_KEY,
+    "Campaigns": NAV_SHOW_CAMPAIGNS_KEY,
+    "Sales Ledger": NAV_SHOW_SALES_LEDGER_KEY,
+    "Schedule": NAV_SHOW_SCHEDULE_KEY,
+    "Ordering": NAV_SHOW_ORDERING_KEY,
+    "POS": NAV_SHOW_POS_KEY,
+    "Scanner": NAV_SHOW_SCANNER_KEY,
+}
 MEMBER_MARGIN_SECTION_KEY = "members_show_margin_section_v1"
 MEMBER_DRINK_TRACKER_SECTION_KEY = "members_show_drink_tracker_section_v1"
 MEMBER_MASS_TEXT_SECTION_KEY = "members_show_mass_text_section_v1"
@@ -2001,6 +2020,7 @@ CIGARPOS_PASSWORD_KEY = "cigarpos_password_enc"
 CIGARPOS_AUTO_SYNC_KEY = "cigarpos_auto_sync_enabled"
 CIGARPOS_AUTO_SYNC_MIN_KEY = "cigarpos_auto_sync_min"
 CIGARPOS_SALES_LAST_SYNC_KEY = "cigarpos_sales_last_sync_v1"
+AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY = "automatic_member_emails_enabled_v1"
 EMAIL_REMINDERS_AUTO_ENABLED_KEY = "email_reminders_auto_enabled_v1"
 EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY = "email_reminders_auto_interval_min_v1"
 EMAIL_REMINDERS_AUTO_LAST_RUN_KEY = "email_reminders_auto_last_run_v1"
@@ -2282,6 +2302,9 @@ def load_ordering_sales_reps(pg: SyncPostgrestClient) -> list[dict]:
                 "id": rep_id,
                 "name": name,
                 "email": email,
+                "phone": str(row.get("phone") or "").strip(),
+                "company": str(row.get("company") or "").strip(),
+                "brands": str(row.get("brands") or "").strip(),
                 "active": _setting_bool(row.get("active"), True),
             }
         )
@@ -2301,6 +2324,9 @@ def save_ordering_sales_reps(pg: SyncPostgrestClient, reps: list[dict]):
                 "id": rep_id,
                 "name": name,
                 "email": email,
+                "phone": str(row.get("phone") or "").strip(),
+                "company": str(row.get("company") or "").strip(),
+                "brands": str(row.get("brands") or "").strip(),
                 "active": _setting_bool(row.get("active"), True),
             }
         )
@@ -2330,6 +2356,7 @@ def upsert_company_reps_into_sales_reps(companies: list[dict], existing_reps: li
             row = dict(updated[match_idx])
             row["name"] = rep_name
             row["email"] = rep_email
+            row["company"] = str((company or {}).get("company") or "").strip()
             row["active"] = True
             row["id"] = str(row.get("id") or hashlib.sha1(rep_name.lower().encode("utf-8")).hexdigest()[:12])
             updated[match_idx] = row
@@ -2339,6 +2366,8 @@ def upsert_company_reps_into_sales_reps(companies: list[dict], existing_reps: li
                     "id": hashlib.sha1(rep_name.lower().encode("utf-8")).hexdigest()[:12],
                     "name": rep_name,
                     "email": rep_email,
+                    "phone": "",
+                    "company": str((company or {}).get("company") or "").strip(),
                     "active": True,
                 }
             )
@@ -2429,6 +2458,8 @@ def load_ordering_companies(pg: SyncPostgrestClient) -> list[dict]:
                 "company": company,
                 "rep_name": rep_name,
                 "rep_email": rep_email,
+                "ordering_url": str(row.get("ordering_url") or "").strip(),
+                "payment_terms": str(row.get("payment_terms") or "").strip(),
                 "active": _setting_bool(row.get("active"), True),
                 "source_file": source_file,
                 "order_note": order_note,
@@ -2461,6 +2492,8 @@ def save_ordering_companies(pg: SyncPostgrestClient, companies: list[dict]):
                 "company": company,
                 "rep_name": rep_name,
                 "rep_email": rep_email,
+                "ordering_url": str((row or {}).get("ordering_url") or "").strip(),
+                "payment_terms": str((row or {}).get("payment_terms") or "").strip(),
                 "active": _setting_bool((row or {}).get("active"), True),
                 "source_file": source_file,
                 "order_note": order_note,
@@ -2468,6 +2501,40 @@ def save_ordering_companies(pg: SyncPostgrestClient, companies: list[dict]):
             }
         )
     _save_json_list_setting(pg, ORDERING_COMPANIES_KEY, clean)
+
+
+def upsert_ordering_company_rep(pg: SyncPostgrestClient, company_name: str, rep_name: str, rep_email: str):
+    company_name = str(company_name or "").strip()
+    if not company_name:
+        return
+
+    companies = load_ordering_companies(pg)
+    updated = []
+    company_found = False
+    for company in companies:
+        row = dict(company)
+        if str(row.get("company") or "").strip().casefold() == company_name.casefold():
+            row["rep_name"] = rep_name
+            row["rep_email"] = rep_email
+            company_found = True
+        updated.append(row)
+
+    if not company_found:
+        updated.append(
+            {
+                "id": hashlib.sha1(company_name.lower().encode("utf-8")).hexdigest()[:12],
+                "company": company_name,
+                "rep_name": rep_name,
+                "rep_email": rep_email,
+                "ordering_url": "",
+                "payment_terms": "",
+                "active": True,
+                "source_file": "",
+                "order_note": "",
+                "order_rows": [],
+            }
+        )
+    save_ordering_companies(pg, updated)
 
 
 def save_ordering_company_draft(
@@ -3175,60 +3242,183 @@ def parse_price_sheet_upload(file_name: str, file_bytes: bytes) -> tuple[list[di
 
 def page_ordering(pg: SyncPostgrestClient):
     st.header("Ordering")
-    st.caption("Select a company, load or build its order form, and send to the linked sales rep email.")
+    st.caption("Select a company to email its sales rep and check messages from listed reps.")
 
     reps = load_ordering_sales_reps(pg)
     companies = load_ordering_companies(pg)
 
-    with st.expander("Sales Reps", expanded=False):
-        st.caption("Maintain rep emails here so orders always route to the right person. Click ➕ at the bottom of the table to add a row.")
+    with st.expander("Sales Rep Directory", expanded=False):
+        st.caption("Edit a rep's company, brands, and contact details here. A new company entered here is added to the Company Directory automatically.")
+        company_names = sorted(
+            {str(company.get("company") or "").strip() for company in companies if str(company.get("company") or "").strip()},
+            key=str.casefold,
+        )
+        no_company_option = "— No company —"
+        add_company_option = "Add a new company..."
+        with st.form("ordering_add_rep_form", clear_on_submit=True):
+            add_rep_name = st.text_input("New rep name")
+            add_rep_email = st.text_input("New rep email")
+            add_rep_phone = st.text_input("New rep phone")
+            add_rep_brands = st.text_input("Brands", help="Enter multiple brands separated by commas.")
+            add_rep_company_choice = st.selectbox(
+                "Company",
+                [no_company_option, *company_names, add_company_option],
+            )
+            add_rep_new_company = st.text_input(
+                "New company name (when adding a new company)",
+            )
+            add_rep_active = st.checkbox("Active", value=True)
+            add_rep_submitted = st.form_submit_button("Add Sales Rep")
+
         editor_rows = [
             {
                 "Name": str(rep.get("name") or ""),
                 "Email": str(rep.get("email") or ""),
+                "Phone": str(rep.get("phone") or ""),
+                "Company": str(rep.get("company") or ""),
+                "Brands": str(rep.get("brands") or ""),
                 "Active": bool(rep.get("active", True)),
             }
             for rep in reps
         ]
         edited_rep_rows = st.data_editor(
             editor_rows,
-            num_rows="dynamic",
+            num_rows="fixed",
             width="stretch",
-            key="ordering_reps_editor",
+            key=f"ordering_reps_editor_{len(reps)}",
         )
-        if st.button("Save Rep Directory", key="ordering_save_reps"):
-            updated = []
-            for row in edited_rep_rows or []:
-                name = str((row or {}).get("Name") or "").strip()
-                email = parseaddr(str((row or {}).get("Email") or "").strip())[1].strip()
-                active = bool((row or {}).get("Active", True))
-                if not name:
-                    continue
-                updated.append(
-                    {
-                        "id": hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12],
-                        "name": name,
-                        "email": email,
-                        "active": active,
-                    }
-                )
-            save_ordering_sales_reps(pg, updated)
-            st.success("Sales rep directory saved.")
-            st.rerun()
 
-    with st.expander("Companies", expanded=True):
-        st.caption("Each company stores a default sales rep email and a saved order form draft. Click ➕ at the bottom of the table to add a row.")
+        existing_reps_by_email = {
+            str(rep.get("email") or "").strip().lower(): rep
+            for rep in reps
+            if str(rep.get("email") or "").strip()
+        }
+        existing_reps_by_name = {
+            str(rep.get("name") or "").strip().lower(): rep
+            for rep in reps
+        }
+        updated_reps = []
+        for row in edited_rep_rows or []:
+            name = str((row or {}).get("Name") or "").strip()
+            email = parseaddr(str((row or {}).get("Email") or "").strip())[1].strip()
+            if not name:
+                continue
+            existing = existing_reps_by_email.get(email.lower()) or existing_reps_by_name.get(name.lower(), {})
+            updated_reps.append(
+                {
+                    "id": str(existing.get("id") or hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12]),
+                    "name": name,
+                    "email": email,
+                    "phone": str((row or {}).get("Phone") or "").strip(),
+                    "company": str((row or {}).get("Company") or "").strip(),
+                    "brands": str((row or {}).get("Brands") or "").strip(),
+                    "active": bool((row or {}).get("Active", True)),
+                }
+            )
+
+        visible_rep_rows = [
+            {
+                "Name": rep["name"],
+                "Email": rep["email"],
+                "Phone": rep["phone"],
+                "Company": rep["company"],
+                "Brands": rep["brands"],
+                "Active": rep["active"],
+            }
+            for rep in updated_reps
+        ]
+        if visible_rep_rows != editor_rows:
+            save_ordering_sales_reps(pg, updated_reps)
+            reps = updated_reps
+            new_company_added = False
+            known_company_names = {
+                str(company.get("company") or "").strip().casefold()
+                for company in load_ordering_companies(pg)
+            }
+            for rep in updated_reps:
+                company_name = str(rep.get("company") or "").strip()
+                if company_name and company_name.casefold() not in known_company_names:
+                    upsert_ordering_company_rep(
+                        pg,
+                        company_name,
+                        str(rep.get("name") or "").strip(),
+                        str(rep.get("email") or "").strip(),
+                    )
+                    known_company_names.add(company_name.casefold())
+                    new_company_added = True
+            st.toast("Sales rep changes saved.")
+            if new_company_added:
+                st.rerun()
+
+        if add_rep_submitted:
+            normalized_email = parseaddr(str(add_rep_email or "").strip())[1].strip()
+            rep_company = (
+                str(add_rep_new_company or "").strip()
+                if add_rep_company_choice == add_company_option
+                else "" if add_rep_company_choice == no_company_option else add_rep_company_choice
+            )
+            if not str(add_rep_name or "").strip():
+                st.warning("Enter the rep's name.")
+            elif not normalized_email or "@" not in normalized_email or any(char.isspace() for char in normalized_email):
+                st.warning("Enter a valid rep email address.")
+            elif add_rep_company_choice == add_company_option and not rep_company:
+                st.warning("Enter the new company name.")
+            else:
+                existing_emails = {
+                    parseaddr(str((row or {}).get("Email") or "").strip())[1].strip().lower()
+                    for row in edited_rep_rows or []
+                }
+                if normalized_email.lower() in existing_emails:
+                    st.warning("That email address is already in the Sales Reps directory.")
+                else:
+                    updated = []
+                    for row in edited_rep_rows or []:
+                        name = str((row or {}).get("Name") or "").strip()
+                        email = parseaddr(str((row or {}).get("Email") or "").strip())[1].strip()
+                        if name:
+                            updated.append(
+                                {
+                                    "id": hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12],
+                                    "name": name,
+                                    "email": email,
+                                    "phone": str((row or {}).get("Phone") or "").strip(),
+                                    "company": str((row or {}).get("Company") or "").strip(),
+                                    "brands": str((row or {}).get("Brands") or "").strip(),
+                                    "active": bool((row or {}).get("Active", True)),
+                                }
+                            )
+                    rep_name = str(add_rep_name).strip()
+                    updated.append(
+                        {
+                            "id": hashlib.sha1(rep_name.lower().encode("utf-8")).hexdigest()[:12],
+                            "name": rep_name,
+                            "email": normalized_email,
+                            "phone": str(add_rep_phone or "").strip(),
+                            "company": rep_company,
+                            "brands": str(add_rep_brands or "").strip(),
+                            "active": bool(add_rep_active),
+                        }
+                    )
+                    save_ordering_sales_reps(pg, updated)
+                    if rep_company:
+                        upsert_ordering_company_rep(pg, rep_company, rep_name, normalized_email)
+                    st.rerun()
+
+    with st.expander("Company Directory", expanded=True):
+        st.caption("Manage company ordering details, primary rep contact, and ordering website here. Company assignments can also be edited in the Sales Rep Directory.")
         auto_sync_company_reps = st.checkbox(
             "Auto-sync company reps into Sales Reps when saving",
             value=bool(st.session_state.get("ordering_auto_sync_company_reps", True)),
             key="ordering_auto_sync_company_reps",
-            help="When enabled, company rep name/email entries are upserted into the Sales Reps directory.",
+            help="When enabled, company rep name/email edits are also saved in the Sales Reps directory.",
         )
         company_editor_rows = [
             {
                 "Company": str(company.get("company") or ""),
                 "Sales Rep": str(company.get("rep_name") or ""),
                 "Rep Email": str(company.get("rep_email") or ""),
+                "Ordering Website": str(company.get("ordering_url") or ""),
+                "Payment Terms": str(company.get("payment_terms") or ""),
                 "Active": bool(company.get("active", True)),
             }
             for company in companies
@@ -3238,345 +3428,305 @@ def page_ordering(pg: SyncPostgrestClient):
             num_rows="dynamic",
             width="stretch",
             key="ordering_company_editor",
-        )
-        if st.button("Save Company Directory", key="ordering_save_companies"):
-            updated_companies = []
-            existing_map = {str(c.get("company") or "").strip().lower(): c for c in companies}
-            for row in edited_company_rows or []:
-                company_name = str((row or {}).get("Company") or "").strip()
-                if not company_name:
-                    continue
-                key_name = company_name.lower()
-                existing = existing_map.get(key_name, {})
-                company_id = str(existing.get("id") or hashlib.sha1(company_name.encode("utf-8")).hexdigest()[:12])
-                updated_companies.append(
-                    {
-                        "id": company_id,
-                        "company": company_name,
-                        "rep_name": str((row or {}).get("Sales Rep") or "").strip(),
-                        "rep_email": parseaddr(str((row or {}).get("Rep Email") or "").strip())[1].strip(),
-                        "active": bool((row or {}).get("Active", True)),
-                        "source_file": str(existing.get("source_file") or ""),
-                        "order_note": str(existing.get("order_note") or ""),
-                        "order_rows": list(existing.get("order_rows") or []),
-                    }
+            column_config={
+                "Payment Terms": st.column_config.SelectboxColumn(
+                    "Payment Terms",
+                    options=["", "Net 30 days", "Credit Card"],
+                    help="Choose the payment terms for this company.",
                 )
+            },
+        )
+        updated_companies = []
+        existing_map = {str(c.get("company") or "").strip().lower(): c for c in companies}
+        for row in edited_company_rows or []:
+            company_name = str((row or {}).get("Company") or "").strip()
+            if not company_name:
+                continue
+            key_name = company_name.lower()
+            existing = existing_map.get(key_name, {})
+            company_id = str(existing.get("id") or hashlib.sha1(company_name.encode("utf-8")).hexdigest()[:12])
+            updated_companies.append(
+                {
+                    "id": company_id,
+                    "company": company_name,
+                    "rep_name": str((row or {}).get("Sales Rep") or "").strip(),
+                    "rep_email": parseaddr(str((row or {}).get("Rep Email") or "").strip())[1].strip(),
+                    "ordering_url": str((row or {}).get("Ordering Website") or "").strip(),
+                    "payment_terms": str((row or {}).get("Payment Terms") or "").strip(),
+                    "active": bool((row or {}).get("Active", True)),
+                    "source_file": str(existing.get("source_file") or ""),
+                    "order_note": str(existing.get("order_note") or ""),
+                    "order_rows": list(existing.get("order_rows") or []),
+                }
+            )
+
+        visible_company_rows = [
+            {
+                "Company": company["company"],
+                "Sales Rep": company["rep_name"],
+                "Rep Email": company["rep_email"],
+                "Ordering Website": company["ordering_url"],
+                "Payment Terms": company["payment_terms"],
+                "Active": company["active"],
+            }
+            for company in updated_companies
+        ]
+        if visible_company_rows != company_editor_rows:
             save_ordering_companies(pg, updated_companies)
             if auto_sync_company_reps:
                 current_reps = load_ordering_sales_reps(pg)
                 merged_reps = upsert_company_reps_into_sales_reps(updated_companies, current_reps)
                 save_ordering_sales_reps(pg, merged_reps)
-            st.success("Company directory saved.")
-            st.rerun()
+                reps = merged_reps
+            st.toast("Company directory changes saved.")
 
     active_companies = [company for company in load_ordering_companies(pg) if company.get("active")]
-
-    _NO_COMPANY = "— None (manual entry) —"
-    company_options = {str(company.get("company") or "Unknown Company"): company for company in active_companies}
-    company_select_options = [_NO_COMPANY] + list(company_options.keys())
-    company_choice = st.selectbox("Company (optional)", company_select_options, key="ordering_company_pick")
+    company_options = {
+        str(company.get("company") or "Unknown Company"): company
+        for company in active_companies
+    }
+    company_choice = st.selectbox(
+        "Company",
+        list(company_options) if company_options else ["No active companies"],
+        key="ordering_company_pick",
+        disabled=not bool(company_options),
+    )
     selected_company = company_options.get(company_choice) or {}
     selected_company_id = str(selected_company.get("id") or "").strip()
 
-    if selected_company_id:
-        active_reps_for_sync = [rep for rep in load_ordering_sales_reps(pg) if rep.get("active")]
-        if active_reps_for_sync:
-            rep_pick_options = {
-                f"{str(rep.get('name') or '').strip()} ({str(rep.get('email') or '').strip() or 'no email'})": rep
-                for rep in active_reps_for_sync
-            }
-            sync_c1, sync_c2 = st.columns(2)
-            rep_pick = sync_c1.selectbox(
-                "Pick rep to copy into this company",
-                list(rep_pick_options.keys()),
-                key=f"ordering_company_rep_pick_{selected_company_id}",
+    if not selected_company:
+        st.info("Add an active company in the Companies directory to start an email.")
+    else:
+        st.subheader(f"Email {selected_company.get('company', 'Sales Rep')}")
+        rep_name_key = f"ordering_rep_name_{selected_company_id}"
+        rep_email_key = f"ordering_rep_email_{selected_company_id}"
+        rep_name = st.text_input(
+            "Sales rep name",
+            value=str(selected_company.get("rep_name") or ""),
+            key=rep_name_key,
+        )
+        rep_email = st.text_input(
+            "Sales rep email",
+            value=str(selected_company.get("rep_email") or ""),
+            key=rep_email_key,
+        )
+        gmail_address = parseaddr(str(rep_email or "").strip())[1].strip()
+        if gmail_address and "@" in gmail_address:
+            gmail_url = "https://mail.google.com/mail/?" + urlencode(
+                {"view": "cm", "fs": "1", "to": gmail_address}
             )
-            if sync_c2.button("Copy Sales Rep → Company", key="ordering_copy_rep_to_company"):
-                selected_rep = rep_pick_options[rep_pick]
-                rep_name_val = str(selected_rep.get("name") or "").strip()
-                rep_email_val = parseaddr(str(selected_rep.get("email") or "").strip())[1].strip()
-                if not rep_name_val or not rep_email_val:
-                    st.warning("Selected sales rep is missing a valid name or email.")
+            st.link_button(gmail_address, gmail_url)
+        normalized_rep_email = parseaddr(str(rep_email or "").strip())[1].strip().lower()
+        selected_rep = next(
+            (
+                rep for rep in reps
+                if normalized_rep_email
+                and parseaddr(str(rep.get("email") or "").strip())[1].strip().lower() == normalized_rep_email
+            ),
+            None,
+        )
+        if selected_rep is None:
+            normalized_rep_name = str(rep_name or "").strip().casefold()
+            selected_rep = next(
+                (
+                    rep for rep in reps
+                    if normalized_rep_name
+                    and str(rep.get("name") or "").strip().casefold() == normalized_rep_name
+                    and str(rep.get("company") or "").strip().casefold()
+                    == str(selected_company.get("company") or "").strip().casefold()
+                ),
+                None,
+            )
+        rep_phone = st.text_input(
+            "Sales rep phone",
+            value=str((selected_rep or {}).get("phone") or ""),
+            key=f"ordering_rep_phone_{selected_company_id}",
+        )
+        if st.button("Save Rep Details", key=f"ordering_save_rep_{selected_company_id}"):
+            normalized_email = parseaddr(str(rep_email or "").strip())[1].strip()
+            if not str(rep_name or "").strip():
+                st.warning("Enter the sales rep's name.")
+            elif not normalized_email or "@" not in normalized_email or any(char.isspace() for char in normalized_email):
+                st.warning("Enter a valid sales rep email address.")
+            else:
+                original_email = parseaddr(str(selected_company.get("rep_email") or "").strip())[1].strip().lower()
+                original_name = str(selected_company.get("rep_name") or "").strip().casefold()
+                company_name = str(selected_company.get("company") or "").strip()
+                rep_index = next(
+                    (
+                        index for index, rep in enumerate(reps)
+                        if original_email
+                        and parseaddr(str(rep.get("email") or "").strip())[1].strip().lower() == original_email
+                    ),
+                    -1,
+                )
+                if rep_index < 0 and original_name:
+                    rep_index = next(
+                        (
+                            index for index, rep in enumerate(reps)
+                            if str(rep.get("name") or "").strip().casefold() == original_name
+                            and str(rep.get("company") or "").strip().casefold() == company_name.casefold()
+                        ),
+                        -1,
+                    )
+                duplicate_email = any(
+                    index != rep_index
+                    and parseaddr(str(rep.get("email") or "").strip())[1].strip().lower() == normalized_email.lower()
+                    for index, rep in enumerate(reps)
+                )
+                if duplicate_email:
+                    st.warning("That email address is already assigned to another sales rep.")
                 else:
-                    companies_now = load_ordering_companies(pg)
-                    updated_companies = []
-                    for _c in companies_now:
-                        row = dict(_c)
-                        if str(row.get("id") or "").strip() == selected_company_id:
-                            row["rep_name"] = rep_name_val
-                            row["rep_email"] = rep_email_val
-                        updated_companies.append(row)
-                    save_ordering_companies(pg, updated_companies)
-                    st.session_state[f"ordering_rep_name_{selected_company_id}"] = rep_name_val
-                    st.session_state[f"ordering_rep_email_{selected_company_id}"] = rep_email_val
-                    st.success(f"Copied {rep_name_val} into {selected_company.get('company', '')}.")
+                    updated_reps = [dict(rep) for rep in reps]
+                    if rep_index >= 0:
+                        updated_reps[rep_index].update(
+                            {
+                                "name": str(rep_name).strip(),
+                                "email": normalized_email,
+                                "phone": str(rep_phone or "").strip(),
+                                "company": company_name,
+                            }
+                        )
+                    else:
+                        updated_reps.append(
+                            {
+                                "id": hashlib.sha1(str(rep_name).strip().lower().encode("utf-8")).hexdigest()[:12],
+                                "name": str(rep_name).strip(),
+                                "email": normalized_email,
+                                "phone": str(rep_phone or "").strip(),
+                                "company": company_name,
+                                "brands": "",
+                                "active": True,
+                            }
+                        )
+                    save_ordering_sales_reps(pg, updated_reps)
+                    upsert_ordering_company_rep(pg, company_name, str(rep_name).strip(), normalized_email)
+                    st.toast("Sales rep details saved.")
                     st.rerun()
 
-        cp_col, _ = st.columns([1, 3])
-        if cp_col.button("Copy Company Rep → Sales Reps", key="ordering_copy_company_rep"):
-            rep_name_val = str(selected_company.get("rep_name") or "").strip()
-            rep_email_val = parseaddr(str(selected_company.get("rep_email") or "").strip())[1].strip()
-            if not rep_name_val:
-                st.warning("Selected company does not have a rep name yet.")
-            elif not rep_email_val:
-                st.warning("Selected company does not have a valid rep email yet.")
-            else:
-                current_reps = load_ordering_sales_reps(pg)
-                rep_updated = False
-                updated_reps = []
-                for rep in current_reps:
-                    row = dict(rep)
-                    existing_name = str(row.get("name") or "").strip().lower()
-                    existing_email = parseaddr(str(row.get("email") or "").strip())[1].strip().lower()
-                    if (existing_email and existing_email == rep_email_val.lower()) or (existing_name and existing_name == rep_name_val.lower()):
-                        row["name"] = rep_name_val
-                        row["email"] = rep_email_val
-                        row["active"] = True
-                        rep_updated = True
-                    updated_reps.append(row)
-                if not rep_updated:
-                    updated_reps.append(
-                        {
-                            "id": hashlib.sha1(rep_name_val.lower().encode("utf-8")).hexdigest()[:12],
-                            "name": rep_name_val,
-                            "email": rep_email_val,
-                            "active": True,
-                        }
-                    )
-                save_ordering_sales_reps(pg, updated_reps)
-                st.success(f"Copied {rep_name_val} to Sales Reps.")
-                st.rerun()
-
-        previous_company_id = str(st.session_state.get("ordering_active_company_id") or "").strip()
-        if previous_company_id != selected_company_id:
-            st.session_state["ordering_active_company_id"] = selected_company_id
-            st.session_state["ordering_rows"] = list(selected_company.get("order_rows") or [])
-            st.session_state["ordering_source_file"] = str(selected_company.get("source_file") or "")
-            st.session_state["ordering_note"] = str(selected_company.get("order_note") or "")
-            st.rerun()
-    else:
-        st.session_state.pop("ordering_active_company_id", None)
-
-    st.divider()
-    st.subheader("Price Sheet Import")
-    upload = st.file_uploader(
-        "Upload vendor price sheet",
-        type=["csv", "xlsx", "xls", "pdf"],
-        key="ordering_price_sheet_upload",
-        help="Supported: CSV, Excel, PDF",
-    )
-
-    if st.button("Parse Price Sheet", key="ordering_parse_sheet"):
-        if upload is None:
-            st.warning("Upload a file first.")
+        rep_brands = str((selected_rep or {}).get("brands") or "").strip()
+        if rep_brands:
+            st.info(f"Brands for {rep_name or selected_company.get('company', 'this rep')}: {rep_brands}")
         else:
-            rows, sheet_meta, err = parse_price_sheet_upload_with_meta(upload.name, upload.getvalue())
-            if err:
-                st.error(err)
-            elif not rows:
-                st.warning("No orderable rows found in the uploaded file.")
-            else:
-                st.session_state["ordering_rows"] = rows
-                st.session_state["ordering_source_file"] = upload.name
+            st.caption("No brands listed for this sales rep.")
 
-                # Derive company name: prefer sheet column, fall back to filename
-                detected_company = str(sheet_meta.get("company") or "").strip()
-                if not detected_company:
-                    detected_company = _company_name_from_filename(upload.name)
+        ordering_url = str(selected_company.get("ordering_url") or "").strip()
+        if ordering_url and "://" not in ordering_url:
+            ordering_url = f"https://{ordering_url}"
+        parsed_ordering_url = urlparse(ordering_url)
+        if parsed_ordering_url.scheme.lower() in {"http", "https"} and parsed_ordering_url.netloc:
+            st.link_button(ordering_url, ordering_url)
+        payment_terms = str(selected_company.get("payment_terms") or "").strip()
+        if payment_terms:
+            st.caption(f"Payment terms: {payment_terms}")
 
-                # Prefer sheet rep info; fall back to whatever is currently on selected company
-                detected_rep_name = str(sheet_meta.get("rep_name") or selected_company.get("rep_name") or "").strip()
-                detected_rep_email = parseaddr(
-                    str(sheet_meta.get("rep_email") or selected_company.get("rep_email") or "").strip()
-                )[1].strip()
-
-                if detected_company:
-                    saved_company = upsert_ordering_company_from_sheet(
-                        pg,
-                        detected_company,
-                        detected_rep_name,
-                        detected_rep_email,
-                        upload.name,
-                        rows,
-                    )
-                    new_id = str(saved_company.get("id") or "").strip()
-                    st.session_state["ordering_active_company_id"] = new_id
-                    st.success(
-                        f"Loaded {len(rows)} item(s) and saved to company **{detected_company}**."
-                    )
-                elif selected_company_id:
-                    save_ordering_company_draft(
-                        pg, selected_company_id, rows, upload.name,
-                        str(st.session_state.get("ordering_note") or ""),
-                    )
-                    st.success(f"Loaded {len(rows)} orderable item(s) from {upload.name}.")
-                else:
-                    st.success(f"Loaded {len(rows)} orderable item(s) from {upload.name}. (No company linked — select one above to save the form.)")
-                st.rerun()
-
-    order_rows = st.session_state.get("ordering_rows", [])
-    source_file = str(st.session_state.get("ordering_source_file") or "")
-    if not order_rows:
-        st.info("Upload and parse a price sheet to start an order.")
-        return
-
-    st.caption(f"Source file: {source_file or 'unknown'}")
-
-    editable_rows = []
-    for row in order_rows:
-        boxes = int(row.get("boxes") or row.get("quantity") or 0)
-        box_price = float(row.get("box_price") or row.get("unit_cost") or 0.0)
-        editable_rows.append(
-            {
-                "SKU": str(row.get("sku") or ""),
-                "Product": str(row.get("name") or ""),
-                "Box Price": round(box_price, 2),
-                "Boxes": boxes,
-                "Line Total": round(box_price * boxes, 2),
-                "Cigars/Box": int(row.get("cigars_per_box") or 0),
-                "Price Source": str(row.get("source_price_type") or "box"),
-                "Rep (from sheet)": str(row.get("rep_name") or ""),
-                "Rep Email (from sheet)": str(row.get("rep_email") or ""),
-            }
+        email_subject = st.text_input(
+            "Subject",
+            value=f"Liberty Smokes - {selected_company.get('company', '')}",
+            key=f"ordering_email_subject_{selected_company_id}",
+        )
+        email_body = st.text_area(
+            "Message",
+            key=f"ordering_email_body_{selected_company_id}",
+            height=180,
         )
 
-    edited_order_rows = st.data_editor(
-        editable_rows,
-        width="stretch",
-        key="ordering_items_editor",
-        hide_index=True,
-        disabled=["SKU", "Product", "Box Price", "Line Total", "Cigars/Box", "Price Source", "Rep (from sheet)", "Rep Email (from sheet)"],
-        column_config={
-            "Boxes": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
-            "Box Price": st.column_config.NumberColumn(format="$%.2f"),
-            "Line Total": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
-
-    updated_rows = []
-    for idx, row in enumerate(order_rows):
-        boxes = int((edited_order_rows[idx] or {}).get("Boxes") or 0) if idx < len(edited_order_rows) else int(row.get("boxes") or row.get("quantity") or 0)
-        updated = dict(row)
-        updated["boxes"] = max(0, boxes)
-        updated["quantity"] = max(0, boxes)
-        updated_rows.append(updated)
-    st.session_state["ordering_rows"] = updated_rows
-
-    selected_lines = [row for row in updated_rows if int(row.get("boxes") or row.get("quantity") or 0) > 0]
-    order_total = round(
-        sum(float(row.get("box_price") or row.get("unit_cost") or 0.0) * int(row.get("boxes") or row.get("quantity") or 0) for row in selected_lines),
-        2,
-    )
-
-    m1, m2 = st.columns(2)
-    m1.metric("Items selected", len(selected_lines))
-    m2.metric("Estimated order total", f"${order_total:,.2f}")
-
-    st.subheader("Route Order")
-    _rep_name_default = str(selected_company.get("rep_name") or "").strip()
-    _rep_email_default = parseaddr(str(selected_company.get("rep_email") or "").strip())[1].strip()
-    rep_key_suffix = selected_company_id or "manual"
-    rep_name = st.text_input("Sales rep name", value=_rep_name_default, key=f"ordering_rep_name_{rep_key_suffix}")
-    rep_email_input = st.text_input(
-        "Sales rep email",
-        value=_rep_email_default,
-        key=f"ordering_rep_email_{rep_key_suffix}",
-        help="Enter the rep's email, or select a company above to auto-fill.",
-    )
-
-    member_smtp = load_smtp_settings(pg)
-    ordering_smtp = load_ordering_smtp_settings(pg)
-    sender_choice = st.radio(
-        "Send using",
-        ["Member SMTP (current default)", "Sales Rep SMTP profile"],
-        key="ordering_sender_choice",
-        horizontal=True,
-    )
-    smtp = ordering_smtp if sender_choice == "Sales Rep SMTP profile" else member_smtp
-    smtp_ready = bool(smtp.get("host")) and bool(smtp.get("port")) and bool(smtp.get("from_addr")) and bool(smtp.get("password"))
-    if not smtp_ready:
-        if sender_choice == "Sales Rep SMTP profile":
-            st.info("Sales Rep SMTP profile is not configured. Set it in Settings -> Sales Rep Email Config (Optional).")
-        else:
-            st.info("Configure SMTP in Settings before sending orders.")
-
-    order_note = st.text_area("Order note (optional)", key="ordering_note", height=90)
-    if selected_company_id and st.button("Save Order Form To Company", key="ordering_save_company_form"):
-        try:
-            save_ordering_company_draft(pg, selected_company_id, updated_rows, source_file, order_note)
-            st.success(f"Saved order form for {selected_company.get('company', '')}.")
-        except Exception as exc:
-            st.error(f"Failed to save company order form: {exc}")
-
-    if st.button("Send Order", key="ordering_send_order", type="primary"):
-        rep_email = parseaddr(str(rep_email_input or "").strip())[1].strip()
+        member_smtp = load_smtp_settings(pg)
+        ordering_smtp = load_ordering_smtp_settings(pg)
+        sender_choice = st.radio(
+            "Send using",
+            ["Member SMTP (current default)", "Sales Rep SMTP profile"],
+            key="ordering_sender_choice",
+            horizontal=True,
+        )
+        smtp = ordering_smtp if sender_choice == "Sales Rep SMTP profile" else member_smtp
+        smtp_ready = bool(smtp.get("host")) and bool(smtp.get("port")) and bool(smtp.get("from_addr")) and bool(smtp.get("password"))
         if not smtp_ready:
-            st.warning("SMTP is not configured.")
-        elif not rep_email:
-            st.warning("Sales rep email is missing or invalid.")
-        elif not selected_lines:
-            st.warning("Set boxes greater than 0 for at least one product.")
-        else:
-            subject = f"Liberty Smokes Order - {datetime.date.today().strftime('%Y-%m-%d')}"
-            body_lines = [
-                f"Company: {selected_company.get('company', '')}",
-                f"Sales Rep: {rep_name}",
-                f"Source Price Sheet: {source_file or 'N/A'}",
-                "",
-                "Order items:",
-            ]
-            for row in selected_lines:
-                boxes = int(row.get("boxes") or row.get("quantity") or 0)
-                box_price = float(row.get("box_price") or row.get("unit_cost") or 0.0)
-                line_total = boxes * box_price
-                sku = str(row.get("sku") or "").strip()
-                name = str(row.get("name") or "").strip()
-                label = f"{sku} - {name}" if sku else name
-                body_lines.append(f"- {label} | Boxes {boxes} | Box ${box_price:,.2f} | Line ${line_total:,.2f}")
-            body_lines.extend(["", f"Estimated total: ${order_total:,.2f}"])
-            if order_note.strip():
-                body_lines.extend(["", "Notes:", order_note.strip()])
+            st.info("Configure the selected SMTP profile in Settings before sending.")
 
-            try:
-                send_email(
-                    smtp["host"],
-                    int(smtp["port"]),
-                    smtp.get("username", ""),
-                    smtp.get("password", ""),
-                    rep_email,
-                    subject,
-                    "\n".join(body_lines),
-                    security=smtp.get("security", "SSL"),
-                    from_addr=smtp.get("from_addr", ""),
-                )
-                save_ordering_company_draft(pg, selected_company_id, updated_rows, source_file, order_note)
-                st.success(f"Order sent to {rep_name or selected_company.get('company', '')} ({rep_email}).")
-            except Exception as exc:
-                st.error(f"Failed to send order: {exc}")
+        if st.button("Send Email", key="ordering_send_email", type="primary"):
+            normalized_rep_email = parseaddr(str(rep_email or "").strip())[1].strip()
+            if not smtp_ready:
+                st.warning("SMTP is not configured.")
+            elif not normalized_rep_email:
+                st.warning("Sales rep email is missing or invalid.")
+            elif not email_subject.strip():
+                st.warning("Enter an email subject.")
+            else:
+                try:
+                    send_email(
+                        smtp["host"],
+                        int(smtp["port"]),
+                        smtp.get("username", ""),
+                        smtp.get("password", ""),
+                        normalized_rep_email,
+                        email_subject.strip(),
+                        email_body,
+                        security=smtp.get("security", "SSL"),
+                        from_addr=smtp.get("from_addr", ""),
+                    )
+                    st.success(f"Email sent to {rep_name or selected_company.get('company', '')} ({normalized_rep_email}).")
+                except Exception as exc:
+                    st.error(f"Failed to send email: {exc}")
 
-    export_buffer = io.StringIO()
-    writer = csv.DictWriter(export_buffer, fieldnames=["sku", "name", "box_price", "boxes", "line_total"])
-    writer.writeheader()
-    for row in selected_lines:
-        boxes = int(row.get("boxes") or row.get("quantity") or 0)
-        box_price = float(row.get("box_price") or row.get("unit_cost") or 0.0)
-        writer.writerow(
+    with st.expander("Inbox from Sales Reps", expanded=False):
+        st.caption("Inbox search and display are limited to active email addresses in the Sales Reps directory.")
+        inbox_settings = load_ordering_imap_settings(pg)
+        with st.form("ordering_imap_settings_form"):
+            imap_col1, imap_col2 = st.columns(2)
+            imap_host = imap_col1.text_input("IMAP server", value=inbox_settings["host"])
+            imap_port = imap_col2.number_input("IMAP port", min_value=1, max_value=65535, value=inbox_settings["port"])
+            imap_username = st.text_input("Inbox email address", value=inbox_settings["username"])
+            imap_password = st.text_input("Inbox password or app password", value=inbox_settings["password"], type="password")
+            imap_security = st.selectbox(
+                "Connection security",
+                ["SSL", "STARTTLS"],
+                index=0 if inbox_settings["security"] == "SSL" else 1,
+            )
+            save_imap_settings = st.form_submit_button("Save Inbox Settings")
+
+        if save_imap_settings:
+            save_setting(pg, "ordering_imap_host", imap_host.strip())
+            save_setting(pg, "ordering_imap_port", str(int(imap_port)))
+            save_setting(pg, "ordering_imap_security", imap_security)
+            save_setting(pg, "ordering_imap_username", imap_username.strip())
+            save_setting(pg, "ordering_imap_password", imap_password)
+            st.success("Inbox settings saved.")
+
+        active_reps = [rep for rep in load_ordering_sales_reps(pg) if rep.get("active")]
+        allowed_addresses = sorted(
             {
-                "sku": str(row.get("sku") or ""),
-                "name": str(row.get("name") or ""),
-                "box_price": round(box_price, 2),
-                "boxes": boxes,
-                "line_total": round(boxes * box_price, 2),
+                parseaddr(str(rep.get("email") or "").strip())[1].strip().lower()
+                for rep in active_reps
+                if parseaddr(str(rep.get("email") or "").strip())[1].strip()
             }
         )
-    st.download_button(
-        "Download Order CSV",
-        data=export_buffer.getvalue(),
-        file_name=f"order_{datetime.date.today().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        width="stretch",
-        disabled=not bool(selected_lines),
-    )
+        if st.button("Check Rep Emails", key="ordering_check_rep_emails", disabled=not bool(allowed_addresses)):
+            saved_inbox_settings = load_ordering_imap_settings(pg)
+            try:
+                st.session_state["ordering_rep_inbox_messages"] = fetch_ordering_rep_emails(
+                    saved_inbox_settings,
+                    allowed_addresses,
+                )
+            except Exception as exc:
+                st.error(f"Could not check the rep inbox: {exc}")
+
+        visible_addresses = set(allowed_addresses)
+        messages = [
+            message
+            for message in st.session_state.get("ordering_rep_inbox_messages", [])
+            if str(message.get("from_email") or "").lower() in visible_addresses
+        ]
+        if not allowed_addresses:
+            st.info("Add active reps with email addresses to the Sales Reps directory first.")
+        elif messages:
+            for index, message in enumerate(messages):
+                subject = str(message.get("subject") or "(no subject)")
+                with st.expander(subject, expanded=index == 0):
+                    st.caption(f"From: {message.get('from_name') or message['from_email']} <{message['from_email']}> · {message.get('date') or 'Date unavailable'}")
+                    st.text(str(message.get("body") or "(No plain-text message body.)"))
+        else:
+            st.info("No matching messages loaded. Select Check Rep Emails to refresh the inbox.")
 
 
 def load_drink_catalog(pg: SyncPostgrestClient) -> list[dict]:
@@ -5227,6 +5377,116 @@ def load_ordering_smtp_settings(pg: SyncPostgrestClient) -> dict:
     }
 
 
+def load_ordering_imap_settings(pg: SyncPostgrestClient) -> dict:
+    host = get_setting(pg, "ordering_imap_host") or "imap.gmail.com"
+    port_raw = get_setting(pg, "ordering_imap_port") or "993"
+    security = (get_setting(pg, "ordering_imap_security") or "SSL").upper()
+    username = get_setting(pg, "ordering_imap_username") or ""
+    password = get_setting(pg, "ordering_imap_password") or ""
+    try:
+        port = int(port_raw)
+    except Exception:
+        port = 993
+    return {
+        "host": host,
+        "port": port,
+        "security": security,
+        "username": username,
+        "password": password,
+    }
+
+
+def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limit: int = 25) -> list[dict]:
+    allowed = {
+        address.lower()
+        for raw_address in allowed_addresses
+        if (address := parseaddr(str(raw_address or "").strip())[1].strip())
+        and re.fullmatch(r"[^@\s\"()<>]+@[^@\s\"()<>]+", address)
+    }
+    if not allowed:
+        return []
+    if not settings.get("host") or not settings.get("username") or not settings.get("password"):
+        raise ValueError("Configure the IMAP server, inbox address, and password first.")
+
+    host = str(settings["host"]).strip()
+    port = int(settings.get("port") or 993)
+    security = str(settings.get("security") or "SSL").upper()
+    if security == "SSL":
+        mailbox = imaplib.IMAP4_SSL(host, port)
+    elif security == "STARTTLS":
+        mailbox = imaplib.IMAP4(host, port)
+        mailbox.starttls()
+    else:
+        raise ValueError("IMAP security must be SSL or STARTTLS.")
+
+    try:
+        mailbox.login(str(settings["username"]).strip(), str(settings["password"]))
+        status, _ = mailbox.select("INBOX", readonly=True)
+        if status != "OK":
+            raise RuntimeError("Could not open the inbox.")
+
+        message_ids: set[bytes] = set()
+        for address in allowed:
+            status, results = mailbox.search(None, "FROM", f'"{address}"')
+            if status == "OK" and results and results[0]:
+                message_ids.update(results[0].split())
+
+        ordered_ids = sorted(message_ids, key=lambda value: int(value), reverse=True)[:max(1, int(limit))]
+        messages = []
+        for message_id in ordered_ids:
+            status, header_parts = mailbox.fetch(
+                message_id,
+                "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])",
+            )
+            if status != "OK":
+                continue
+            raw_header = next(
+                (part[1] for part in header_parts if isinstance(part, tuple) and isinstance(part[1], bytes)),
+                b"",
+            )
+            header = BytesParser(policy=policy.default).parsebytes(raw_header)
+            from_name, from_email = parseaddr(str(header.get("From") or ""))
+            from_email = from_email.strip().lower()
+            if from_email not in allowed:
+                continue
+
+            status, full_parts = mailbox.fetch(message_id, "(BODY.PEEK[])")
+            if status != "OK":
+                continue
+            raw_message = next(
+                (part[1] for part in full_parts if isinstance(part, tuple) and isinstance(part[1], bytes)),
+                b"",
+            )
+            parsed_message = BytesParser(policy=policy.default).parsebytes(raw_message)
+            body_parts = []
+            for part in parsed_message.walk():
+                if part.get_content_type() != "text/plain" or part.get_content_disposition() == "attachment":
+                    continue
+                try:
+                    content = part.get_content()
+                except (LookupError, UnicodeDecodeError):
+                    payload = part.get_payload(decode=True) or b""
+                    content = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                if isinstance(content, str) and content.strip():
+                    body_parts.append(content.strip())
+
+            messages.append(
+                {
+                    "from_name": from_name,
+                    "from_email": from_email,
+                    "subject": str(parsed_message.get("Subject") or ""),
+                    "date": str(parsed_message.get("Date") or ""),
+                    "body": "\n\n".join(body_parts)[:5000],
+                }
+            )
+        return messages
+    finally:
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
+
 def _phone_to_e164(phone: str, default_country_code: str = "+1") -> str:
     raw = str(phone or "").strip()
     if not raw:
@@ -5771,6 +6031,8 @@ def maybe_run_automated_member_reminders(
     templates: dict,
     members: list[dict],
 ) -> tuple[bool, str, dict]:
+    if not _bool_setting(get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False):
+        return False, "disabled", {}
     enabled = _bool_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY), False)
     if not enabled:
         return False, "disabled", {}
@@ -6524,7 +6786,7 @@ def page_members(pg: SyncPostgrestClient):
             if fn and ln:
                 try:
                     added_member = add_member(pg, fn, ln, em, phone, tier, locker, int(months))
-                    if em.strip():
+                    if em.strip() and _bool_setting(get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False):
                         try:
                             templates = load_email_templates(pg)
                             smtp = load_smtp_settings(pg)
@@ -6550,6 +6812,8 @@ def page_members(pg: SyncPostgrestClient):
                                 st.info("Member added. SMTP is not fully configured, so welcome email was skipped.")
                         except Exception as exc:
                             st.warning(f"Member added, but welcome email failed: {exc}")
+                    elif em.strip():
+                        st.info("Member added. Automatic welcome emails are disabled.")
                     st.success(f"Added {fn} {ln}.")
                     queue_widget_reset(
                         {
@@ -6660,18 +6924,32 @@ def page_members(pg: SyncPostgrestClient):
             else:
                 st.info("No missing refill dates found.")
             st.rerun()
-    st.caption("Mark members as refilled after you complete their refills.")
+    st.caption("Only cards due today and not overfilled appear here; future-due and overdue cards are excluded.")
     
     refill_due_members = fetch_gift_card_refill_due(pg)
+    refill_rows_all = fetch_member_monthly_refills(pg)
+    refill_months_by_member: dict[str, int] = {}
+    for refill_row in refill_rows_all:
+        refill_member_id = str(refill_row.get("member_id") or "").strip()
+        if refill_member_id:
+            refill_months_by_member[refill_member_id] = int(
+                refill_months_by_member.get(refill_member_id, 0)
+            ) + parse_refill_credit_months(str(refill_row.get("notes") or ""))
+    refill_members_by_id = {str(member.get("id")): member for member in members}
     
-    # Filter for today's refills
+    # Only prompt for cards due today; overdue and overfilled cards are excluded.
     today_refills = []
     for m in refill_due_members:
         refill_date = m.get("calculated_refill_date") or m.get("next_gift_card_refill_date")
         try:
             if refill_date:
                 refill_dt = datetime.datetime.strptime(refill_date, "%Y-%m-%d").date()
-                if refill_dt <= today:
+                member_id = str(m.get("id") or "").strip()
+                member_record = refill_members_by_id.get(member_id, {})
+                active_months = member_active_months(member_record, today)
+                credited_months = refill_months_by_member.get(member_id, 0)
+                is_overfilled = credited_months > active_months
+                if refill_dt == today and not is_overfilled:
                     today_refills.append(m)
         except Exception:
             pass
@@ -6785,15 +7063,8 @@ def page_members(pg: SyncPostgrestClient):
     st.caption("Track who received their monthly gift card so each member is only refilled once per month.")
 
     refill_month_options = []
-    refill_rows_all = fetch_member_monthly_refills(pg)
-    refill_months_by_member: dict[str, int] = {}
     for row in refill_rows_all:
-        member_id_txt = str(row.get("member_id") or "").strip()
         mstart = str(row.get("month_start") or "").strip()
-        if member_id_txt and mstart:
-            refill_months_by_member[member_id_txt] = int(refill_months_by_member.get(member_id_txt, 0)) + parse_refill_credit_months(
-                str(row.get("notes") or "")
-            )
         if mstart and mstart not in refill_month_options:
             refill_month_options.append(mstart)
     current_refill_month = month_start_for()
@@ -7598,9 +7869,12 @@ def page_members(pg: SyncPostgrestClient):
             templates,
             members,
         )
+        automatic_emails_enabled = _bool_setting(
+            get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False
+        )
         auto_enabled = _bool_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY), False)
         auto_interval = max(5, _int_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY), 60))
-        if auto_enabled:
+        if automatic_emails_enabled and auto_enabled:
             if auto_ran:
                 if int(auto_stats.get("sent", 0)) > 0:
                     st.success(
@@ -7615,6 +7889,8 @@ def page_members(pg: SyncPostgrestClient):
                     f"Automated reminders are enabled (every {auto_interval} min). "
                     f"Next check in about {mins_left} min."
                 )
+        elif not automatic_emails_enabled:
+            st.caption("Automatic member emails are disabled in Settings.")
 
         pending = get_pending_reminders(members, templates)
         deliverable_pending = [p for p in pending if parseaddr(str(p.get("email") or "").strip())[1].strip()]
@@ -8645,8 +8921,9 @@ def page_pos(pg: SyncPostgrestClient):
         ar1, ar2 = st.columns([2, 1])
         auto_scan = ar1.checkbox(
             "Live import scans (auto)",
-            value=st.session_state.get("pos_auto_scan", True),
-            key="pos_auto_scan",
+            value=st.session_state.get("pos_auto_scan_enabled", False),
+            key="pos_auto_scan_enabled",
+            help="When enabled, the POS page refreshes at the selected interval to import scans. Leave off while editing to avoid interrupting entry.",
         )
         auto_scan_sec = ar2.number_input(
             "Refresh (sec)",
@@ -9699,22 +9976,22 @@ def page_settings(pg: SyncPostgrestClient):
             help="Turn responsive mobile styling on or off.",
         )
         st.divider()
-        st.caption("Sidebar navigation visibility")
-        prev_show_pos = bool(st.session_state.get("show_pos_nav", True))
-        prev_show_scanner = bool(st.session_state.get("show_scanner_nav", True))
+        st.caption("Sidebar navigation visibility. Settings always stays available.")
+        prev_nav_visibility = {
+            page_name: _bool_setting(get_setting(pg, setting_key), True)
+            for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items()
+        }
+        cfg_nav_visibility = {
+            page_name: st.checkbox(
+                f"Show {page_name} in sidebar",
+                value=prev_nav_visibility[page_name],
+                key=f"cfg_show_nav_{page_name.lower().replace(' ', '_')}",
+            )
+            for page_name in NAV_PAGE_SETTING_KEYS
+        }
         prev_show_member_margin = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), False)
         prev_show_member_drink_tracker = _bool_setting(get_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY), False)
         prev_show_member_mass_text = _bool_setting(get_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY), True)
-        cfg_show_pos = st.checkbox(
-            "Show POS in sidebar",
-            value=prev_show_pos,
-            key="cfg_show_pos_nav",
-        )
-        cfg_show_scanner = st.checkbox(
-            "Show Scanner in sidebar",
-            value=prev_show_scanner,
-            key="cfg_show_scanner_nav",
-        )
         cfg_show_member_margin = st.checkbox(
             "Show Member Purchase Margins in Members page",
             value=prev_show_member_margin,
@@ -9731,19 +10008,16 @@ def page_settings(pg: SyncPostgrestClient):
             key="cfg_show_member_mass_text",
         )
         if (
-            cfg_show_pos != prev_show_pos
-            or cfg_show_scanner != prev_show_scanner
+            cfg_nav_visibility != prev_nav_visibility
             or cfg_show_member_margin != prev_show_member_margin
             or cfg_show_member_drink_tracker != prev_show_member_drink_tracker
             or cfg_show_member_mass_text != prev_show_member_mass_text
         ):
-            save_setting(pg, NAV_SHOW_POS_KEY, "1" if cfg_show_pos else "0")
-            save_setting(pg, NAV_SHOW_SCANNER_KEY, "1" if cfg_show_scanner else "0")
+            for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items():
+                save_setting(pg, setting_key, "1" if cfg_nav_visibility[page_name] else "0")
             save_setting(pg, MEMBER_MARGIN_SECTION_KEY, "1" if cfg_show_member_margin else "0")
             save_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY, "1" if cfg_show_member_drink_tracker else "0")
             save_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY, "1" if cfg_show_member_mass_text else "0")
-            st.session_state["show_pos_nav"] = bool(cfg_show_pos)
-            st.session_state["show_scanner_nav"] = bool(cfg_show_scanner)
             st.rerun()
 
     with st.expander("Drink Limits", expanded=True):
@@ -10216,10 +10490,20 @@ def page_settings(pg: SyncPostgrestClient):
                 st.error(f"Failed: {exc}")
 
     with st.expander("Automated Reminder Emails", expanded=False):
+        automatic_emails_enabled = _bool_setting(
+            get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False
+        )
         auto_enabled = _bool_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY), False)
         auto_interval = max(5, _int_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY), 60))
         auto_last_run = get_setting(pg, EMAIL_REMINDERS_AUTO_LAST_RUN_KEY)
         auto_last_result = get_setting(pg, EMAIL_REMINDERS_AUTO_LAST_RESULT_KEY)
+
+        cfg_automatic_emails_enabled = st.checkbox(
+            "Allow automatic member emails (welcome emails and reminders)",
+            value=automatic_emails_enabled,
+            key="cfg_automatic_member_emails",
+            help="When off, adding a member will not send a welcome email and scheduled reminders will not send. Manual email actions remain available.",
+        )
 
         a1, a2 = st.columns(2)
         cfg_auto_enabled = a1.checkbox(
@@ -10239,6 +10523,11 @@ def page_settings(pg: SyncPostgrestClient):
 
         s1, s2 = st.columns(2)
         if s1.button("Save Automation Settings", key="cfg_save_auto_email_reminders"):
+            save_setting(
+                pg,
+                AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY,
+                "1" if cfg_automatic_emails_enabled else "0",
+            )
             save_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY, "1" if cfg_auto_enabled else "0")
             save_setting(pg, EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY, str(int(cfg_auto_interval)))
             st.success("Automation settings saved.")
@@ -10276,7 +10565,7 @@ def page_settings(pg: SyncPostgrestClient):
                 st.error(f"Reminder cycle failed: {exc}")
 
         st.caption(
-            "This toggle must be enabled for both in-app automation and the Windows scheduled task. "
+            "The automatic member emails switch above is the master opt-in; this reminder toggle must also be enabled for scheduled reminder sending. "
             "Reminder runs now catch members due within 7 days and any member already past due if they have not been emailed yet."
         )
         st.caption(f"Last run: {_format_datetime_12h(auto_last_run) or 'never'}")
@@ -10542,34 +10831,30 @@ def main():
     if pending_nav:
         st.session_state["nav_page"] = pending_nav
     pg = get_postgrest_client()
-    if "show_pos_nav" not in st.session_state:
-        raw_show_pos = str(get_setting(pg, NAV_SHOW_POS_KEY) or "1").strip().lower()
-        st.session_state["show_pos_nav"] = raw_show_pos in {"1", "true", "yes", "y", "on"}
-    if "show_scanner_nav" not in st.session_state:
-        raw_show_scanner = str(get_setting(pg, NAV_SHOW_SCANNER_KEY) or "1").strip().lower()
-        st.session_state["show_scanner_nav"] = raw_show_scanner in {"1", "true", "yes", "y", "on"}
+    nav_pages = [
+        page_name
+        for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items()
+        if _bool_setting(get_setting(pg, setting_key), True)
+    ]
+    nav_pages.append("Settings")
+    query_page = str(st.query_params.get("liberty_nav") or "").strip()
+    if st.session_state.get("nav_page") not in nav_pages:
+        st.session_state["nav_page"] = query_page if query_page in nav_pages else nav_pages[0]
 
     with st.sidebar:
         logo_path = get_sidebar_logo_path()
         if logo_path is not None:
             st.image(str(logo_path), width="stretch")
-        show_pos_nav = bool(st.session_state.get("show_pos_nav", True))
-        show_scanner_nav = bool(st.session_state.get("show_scanner_nav", True))
-
-        nav_pages = ["Seats", "Members", "Campaigns", "Sales Ledger", "Schedule", "Ordering"]
-        if show_pos_nav:
-            nav_pages.append("POS")
-        if show_scanner_nav:
-            nav_pages.append("Scanner")
-        nav_pages.append("Settings")
-        if st.session_state.get("nav_page") not in nav_pages:
-            st.session_state["nav_page"] = "Seats"
         page = st.radio(
             "Navigate",
             nav_pages,
             key="nav_page",
             label_visibility="collapsed",
         )
+        if "page" in st.query_params:
+            del st.query_params["page"]
+        if st.query_params.get("liberty_nav") != page:
+            st.query_params["liberty_nav"] = page
 
     if page == "Seats":
         page_seats(pg)

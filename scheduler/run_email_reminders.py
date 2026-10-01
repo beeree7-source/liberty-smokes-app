@@ -29,6 +29,7 @@ EMAIL_TEMPLATE_DEFAULTS = {
     ),
 }
 
+AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY = "automatic_member_emails_enabled_v1"
 EMAIL_REMINDERS_AUTO_ENABLED_KEY = "email_reminders_auto_enabled_v1"
 EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY = "email_reminders_auto_interval_min_v1"
 EMAIL_REMINDERS_AUTO_LAST_RUN_KEY = "email_reminders_auto_last_run_v1"
@@ -379,6 +380,13 @@ def main() -> int:
         return 1
 
     pg = get_postgrest_client(supabase_url, supabase_key)
+
+    automatic_emails_enabled = _bool_setting(
+        get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False
+    )
+    if not automatic_emails_enabled and not args.force:
+        print("SKIP: automatic member emails are disabled in app settings.")
+        return 0
 
     enabled = _bool_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY), False)
     if not enabled and not args.force:
