@@ -7436,16 +7436,12 @@ def page_members(pg: SyncPostgrestClient):
     else:
         st.dataframe(tracker_rows, width="stretch", hide_index=True)
 
-    st.divider()
-    st.subheader("Communications")
-    st.caption("Mass email and text tools moved to the Campaigns page in the sidebar.")
-
     by_id = {str(m.get("id")): m for m in members}
     current_month = month_start_for()
 
-    st.divider()
     show_member_drink_tracker_section = _bool_setting(get_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY), False)
     if show_member_drink_tracker_section:
+        st.divider()
         st.subheader("Drink Tracker")
         month_options = []
         month_rows_all = fetch_member_monthly_drinks(pg)
