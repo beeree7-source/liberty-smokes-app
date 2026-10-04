@@ -3220,30 +3220,42 @@ def set_price_list_label(pg: SyncPostgrestClient, company_id: str, file_name: st
         labels.pop(key, None)
     save_setting(pg, PRICE_LIST_LABELS_KEY, json.dumps(labels))
 
-def list_company_price_lists(company_id: str) -> list[Path]:
-    folder = _price_list_path(company_id, "x").parent
-    if not folder.is_dir():
-        return []
-    return sorted((f for f in folder.iterdir() if f.is_file()), key=lambda f: f.name.lower())
+def _price_list_prefix(company_id: str) -> str:
+    return f"PriceLists/{re.sub(r'[^A-Za-z0-9_-]', '', str(company_id or ''))}"
 
 
-def _sync_primary_price_list(pg: SyncPostgrestClient, company_id: str):
-    files = list_company_price_lists(company_id)
+def list_company_price_lists(company_id: str) -> list[str]:
+    prefix = _price_list_prefix(company_id)
+    local = _price_list_path(company_id, "x").parent
+    names = {str(i.get("name")) for i in storage_list_files(prefix)}
+    if local.is_dir():
+        # Move files from the old on-disk location into Storage once.
+        for f in local.iterdir():
+            safe = _safe_storage_name(f.name)
+            if f.is_file() and safe not in names:
+                try:
+                    storage_upload_file(prefix, f.name, f.read_bytes())
+                    names.add(safe)
+                except Exception:
+                    pass
+    return sorted(names, key=str.lower)
+
+
+def _sync_primary_price_list(pg: SyncPostgrestClient, company_id: str, files: list[str]):
     companies = load_ordering_companies(pg)
     for company in companies:
         if str(company.get("id") or "") == str(company_id):
-            company["price_list_file"] = files[0].name if files else ""
+            company["price_list_file"] = files[0] if files else ""
     save_ordering_companies(pg, companies)
 
 
 def save_company_price_list(pg: SyncPostgrestClient, company_id: str, file_name: str, data: bytes):
-    path = _price_list_path(company_id, file_name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    _sync_primary_price_list(pg, company_id)
+    storage_upload_file(_price_list_prefix(company_id), file_name, data)
+    _sync_primary_price_list(pg, company_id, list_company_price_lists(company_id))
 
 
 def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_name: str):
+    storage_delete_file(_price_list_prefix(company_id), file_name)
     try:
         _price_list_path(company_id, file_name).unlink(missing_ok=True)
     except OSError:
@@ -3252,7 +3264,7 @@ def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_nam
         set_price_list_label(pg, company_id, file_name, "")
     except Exception:
         pass
-    _sync_primary_price_list(pg, company_id)
+    _sync_primary_price_list(pg, company_id, list_company_price_lists(company_id))
 
 def _render_zoomable_pages(pages_b64: list[str], key: str = "", height: int = 600):
     imgs = "".join(f'<img src="data:image/png;base64,{b}">' for b in pages_b64)
@@ -3293,10 +3305,14 @@ document.getElementById('fs').onclick=()=>{const w=document.getElementById('wrap
     components.html(html, height=height, scrolling=False)
 
 
-def _render_price_list_file(pg: SyncPostgrestClient, company_id: str, path: Path):
-    data = path.read_bytes()
-    suffix = path.suffix.lower()
-    fkey = hashlib.sha1(f"{company_id}/{path.name}".encode("utf-8")).hexdigest()[:10]
+def _render_price_list_file(pg: SyncPostgrestClient, company_id: str, name: str):
+    try:
+        data = storage_download_file(_price_list_prefix(company_id), name)
+    except Exception as exc:
+        st.error(f"Could not load this price list: {exc}")
+        return
+    suffix = Path(name).suffix.lower()
+    fkey = hashlib.sha1(f"{company_id}/{name}".encode("utf-8")).hexdigest()[:10]
     try:
         if suffix == ".pdf":
             import fitz
@@ -3316,18 +3332,22 @@ def _render_price_list_file(pg: SyncPostgrestClient, company_id: str, path: Path
     except Exception:
         st.info("Preview unavailable for this file. Use Download to open it.")
     col_dl, col_rm = st.columns(2)
-    col_dl.download_button("Download", data=data, file_name=path.name, key=f"price_list_download_{fkey}")
+    col_dl.download_button("Download", data=data, file_name=name, key=f"price_list_download_{fkey}")
     if col_rm.button("Remove", key=f"price_list_remove_{fkey}"):
-        remove_company_price_list(pg, company_id, path.name)
+        remove_company_price_list(pg, company_id, name)
         st.rerun()
 
 
 def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company_name: str, file_name: str):
-    files = list_company_price_lists(company_id)
+    try:
+        files = list_company_price_lists(company_id)
+    except Exception as exc:
+        st.warning(f"Price lists unavailable: {exc}")
+        files = []
     labels = load_price_list_labels(pg)
 
-    def label_of(f: Path) -> str:
-        return labels.get(f"{company_id}/{f.name}") or f.stem
+    def label_of(f: str) -> str:
+        return labels.get(f"{company_id}/{f}") or Path(f).stem
 
     title = f"{company_name} Price Lists ({len(files)})" if len(files) > 1 else f"{company_name} Price List"
     with st.expander(title, expanded=bool(files)):
@@ -3342,7 +3362,7 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
                     format_func=label_of,
                     key=f"price_list_pick_{company_id}",
                 )
-            fkey = hashlib.sha1(f"{company_id}/{chosen.name}".encode("utf-8")).hexdigest()[:10]
+            fkey = hashlib.sha1(f"{company_id}/{chosen}".encode("utf-8")).hexdigest()[:10]
             name_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
             new_label = name_col.text_input(
                 "Name (e.g. the company this list is for)",
@@ -3350,9 +3370,9 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
                 key=f"price_list_label_{fkey}",
             )
             if btn_col.button("Rename", key=f"price_list_rename_{fkey}"):
-                set_price_list_label(pg, company_id, chosen.name, new_label)
+                set_price_list_label(pg, company_id, chosen, new_label)
                 st.rerun()
-            st.caption(f"File: {chosen.name}")
+            st.caption(f"File: {chosen}")
             _render_price_list_file(pg, company_id, chosen)
 
         gen_key = f"price_list_gen_{company_id}"
@@ -3373,7 +3393,7 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
         if uploads and st.button("Save price list(s)", key=f"price_list_save_{company_id}", type="primary"):
             for i, upload in enumerate(uploads):
                 save_company_price_list(pg, company_id, upload.name, upload.getvalue())
-                set_price_list_label(pg, company_id, _price_list_path(company_id, upload.name).name, upload_names.get(i, ""))
+                set_price_list_label(pg, company_id, _safe_storage_name(upload.name), upload_names.get(i, ""))
             st.session_state[gen_key] = gen + 1
             st.rerun()
 
