@@ -3,6 +3,8 @@ import base64
 import csv
 import datetime
 import hashlib
+import hmac
+import os
 import html
 import io
 import importlib
@@ -10977,6 +10979,183 @@ def page_files(pg: SyncPostgrestClient):
                 _render_files_section(pg, category, allow_email=(category == "Licenses"))
 
 
+APP_USERS_KEY = "app_users_v1"
+AUTH_SESSION_KEY = "auth_user"
+EXTRA_PERMISSION_PAGES = ["Settings"]
+
+
+def _all_permission_pages() -> list[str]:
+    return list(NAV_PAGE_SETTING_KEYS.keys()) + EXTRA_PERMISSION_PAGES
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+
+
+def load_app_users(pg: SyncPostgrestClient) -> list[dict]:
+    try:
+        data = json.loads(get_setting(pg, APP_USERS_KEY) or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [u for u in data if isinstance(u, dict) and u.get("username")] if isinstance(data, list) else []
+
+
+def save_app_users(pg: SyncPostgrestClient, users: list[dict]):
+    save_setting(pg, APP_USERS_KEY, json.dumps(users))
+
+
+def _make_user(username: str, name: str, password: str, role: str, pages: list[str]) -> dict:
+    salt = os.urandom(16).hex()
+    return {
+        "username": username.strip().lower(),
+        "name": name.strip() or username.strip(),
+        "salt": salt,
+        "hash": _hash_password(password, salt),
+        "role": role,
+        "pages": pages,
+        "active": True,
+    }
+
+
+def _verify_user(users: list[dict], username: str, password: str) -> dict | None:
+    user = next((u for u in users if u["username"] == username.strip().lower()), None)
+    candidate = _hash_password(password, user["salt"]) if user else _hash_password(password, "00" * 16)
+    if user and user.get("active", True) and hmac.compare_digest(candidate, str(user.get("hash") or "")):
+        return user
+    return None
+
+
+def _require_login(pg: SyncPostgrestClient) -> dict | None:
+    users = load_app_users(pg)
+    current = st.session_state.get(AUTH_SESSION_KEY)
+    if current:
+        fresh = next((u for u in users if u["username"] == current["username"]), None)
+        if fresh and fresh.get("active", True):
+            st.session_state[AUTH_SESSION_KEY] = fresh
+            return fresh
+        st.session_state.pop(AUTH_SESSION_KEY, None)
+
+    _, center, _ = st.columns([1, 2, 1])
+    with center:
+        if not users:
+            st.subheader("Set up the admin account")
+            st.caption("This is the first run. Create the owner login. You can add employee accounts afterwards.")
+            setup_code = str(st.secrets.get("ADMIN_SETUP_CODE") or "")
+            with st.form("auth_setup"):
+                name = st.text_input("Your name")
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                confirm = st.text_input("Confirm password", type="password")
+                code = st.text_input("Setup code", type="password") if setup_code else ""
+                if st.form_submit_button("Create admin account", type="primary"):
+                    if setup_code and not hmac.compare_digest(code, setup_code):
+                        st.error("Wrong setup code.")
+                    elif not username.strip() or len(password) < 8:
+                        st.error("Enter a username and a password of at least 8 characters.")
+                    elif password != confirm:
+                        st.error("Passwords do not match.")
+                    else:
+                        admin = _make_user(username, name, password, "admin", _all_permission_pages())
+                        save_app_users(pg, [admin])
+                        st.session_state[AUTH_SESSION_KEY] = admin
+                        st.rerun()
+            return None
+
+        st.subheader("Sign in")
+        with st.form("auth_login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in", type="primary")
+        if submitted:
+            fails = int(st.session_state.get("auth_fails", 0))
+            if fails >= 5:
+                st.error("Too many attempts. Reload the page and try again later.")
+                time.sleep(2)
+            else:
+                user = _verify_user(users, username, password)
+                if user:
+                    st.session_state["auth_fails"] = 0
+                    st.session_state[AUTH_SESSION_KEY] = user
+                    st.rerun()
+                st.session_state["auth_fails"] = fails + 1
+                st.error("Incorrect username or password.")
+    return None
+
+
+def user_can_access(user: dict, page_name: str) -> bool:
+    return user.get("role") == "admin" or page_name in (user.get("pages") or [])
+
+
+def page_users(pg: SyncPostgrestClient, me: dict):
+    st.header("Users & Permissions")
+    st.caption("Create employee logins and choose which pages each person can open. Admins can open everything.")
+    users = load_app_users(pg)
+    all_pages = _all_permission_pages()
+
+    flash = st.session_state.pop("users_flash", "")
+    if flash:
+        st.success(flash)
+
+    with st.expander("Add a new user", expanded=not [u for u in users if u["role"] != "admin"]):
+        with st.form("users_add", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Full name")
+            username = c2.text_input("Username")
+            c3, c4 = st.columns(2)
+            password = c3.text_input("Temporary password", type="password")
+            role = c4.selectbox("Role", ["employee", "admin"])
+            pages = st.multiselect("Pages this employee can open", all_pages, default=[p for p in all_pages if p != "Settings"])
+            if st.form_submit_button("Create user", type="primary"):
+                uname = username.strip().lower()
+                if not uname or len(password) < 8:
+                    st.error("Enter a username and a password of at least 8 characters.")
+                elif any(u["username"] == uname for u in users):
+                    st.error("That username already exists.")
+                else:
+                    users.append(_make_user(uname, name, password, role, pages))
+                    save_app_users(pg, users)
+                    st.session_state["users_flash"] = f"Created {uname}."
+                    st.rerun()
+
+    st.subheader("Existing users")
+    admin_count = sum(1 for u in users if u["role"] == "admin" and u.get("active", True))
+    for u in users:
+        uname = u["username"]
+        title = f"{u['name']} ({uname}) — {u['role']}{'' if u.get('active', True) else ' — disabled'}"
+        with st.expander(title):
+            is_last_admin = u["role"] == "admin" and u.get("active", True) and admin_count <= 1
+            new_name = st.text_input("Name", value=u["name"], key=f"u_name_{uname}")
+            new_role = st.selectbox(
+                "Role", ["employee", "admin"], index=0 if u["role"] == "employee" else 1,
+                key=f"u_role_{uname}", disabled=is_last_admin,
+            )
+            new_pages = st.multiselect(
+                "Pages", all_pages, default=[p for p in (u.get("pages") or []) if p in all_pages],
+                key=f"u_pages_{uname}", disabled=new_role == "admin",
+            )
+            active = st.checkbox("Account enabled", value=u.get("active", True), key=f"u_active_{uname}", disabled=is_last_admin)
+            new_pw = st.text_input("Reset password (leave blank to keep)", type="password", key=f"u_pw_{uname}")
+            b1, b2 = st.columns(2)
+            if b1.button("Save changes", key=f"u_save_{uname}", type="primary"):
+                if new_pw and len(new_pw) < 8:
+                    st.error("Password must be at least 8 characters.")
+                else:
+                    u["name"] = new_name.strip() or uname
+                    u["role"] = new_role
+                    u["pages"] = all_pages if new_role == "admin" else new_pages
+                    u["active"] = bool(active)
+                    if new_pw:
+                        u["salt"] = os.urandom(16).hex()
+                        u["hash"] = _hash_password(new_pw, u["salt"])
+                    save_app_users(pg, users)
+                    st.session_state["users_flash"] = f"Saved {uname}."
+                    st.rerun()
+            if uname != me["username"] and not is_last_admin:
+                if b2.button("Delete user", key=f"u_del_{uname}"):
+                    save_app_users(pg, [x for x in users if x["username"] != uname])
+                    st.session_state["users_flash"] = f"Deleted {uname}."
+                    st.rerun()
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -10990,12 +11169,24 @@ def main():
     if pending_nav:
         st.session_state["nav_page"] = pending_nav
     pg = get_postgrest_client()
+    me = _require_login(pg)
+    if not me:
+        return
     nav_pages = [
         page_name
         for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items()
-        if _bool_setting(get_setting(pg, setting_key), True)
+        if _bool_setting(get_setting(pg, setting_key), True) and user_can_access(me, page_name)
     ]
-    nav_pages.append("Settings")
+    if user_can_access(me, "Settings"):
+        nav_pages.append("Settings")
+    if me.get("role") == "admin":
+        nav_pages.append("Users")
+    if not nav_pages:
+        st.warning("Your account has no pages assigned yet. Ask an admin for access.")
+        if st.button("Sign out"):
+            st.session_state.pop(AUTH_SESSION_KEY, None)
+            st.rerun()
+        return
     query_page = str(st.query_params.get("liberty_nav") or "").strip()
     if st.session_state.get("nav_page") not in nav_pages:
         st.session_state["nav_page"] = query_page if query_page in nav_pages else nav_pages[0]
@@ -11025,6 +11216,10 @@ def main():
             label_visibility="collapsed",
             format_func=lambda name: f"Inbox ({unread_count})" if name == "Inbox" and unread_count else name,
         )
+        st.caption(f"Signed in as {me['name']}")
+        if st.button("Sign out", key="auth_signout"):
+            st.session_state.pop(AUTH_SESSION_KEY, None)
+            st.rerun()
         if "page" in st.query_params:
             del st.query_params["page"]
         if st.query_params.get("liberty_nav") != page:
@@ -11052,6 +11247,8 @@ def main():
         page_scanner(pg)
     elif page == "Settings":
         page_settings(pg)
+    elif page == "Users":
+        page_users(pg, me)
 
 
 if __name__ == "__main__":
