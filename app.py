@@ -3215,6 +3215,45 @@ def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_nam
     save_ordering_companies(pg, companies)
 
 
+def _render_zoomable_pages(pages_b64: list[str], key: str = "", height: int = 600):
+    imgs = "".join(f'<img src="data:image/png;base64,{b}">' for b in pages_b64)
+    html = """
+<style>
+body{margin:0;font-family:sans-serif;background:#111}
+#bar{display:flex;gap:6px;padding:6px;background:#222}
+#bar button{flex:1;padding:8px;font-size:16px;border:0;border-radius:6px;background:#444;color:#fff}
+#box{position:relative;overflow:auto;height:calc(100vh - 50px);background:#111;touch-action:pan-x pan-y;-webkit-overflow-scrolling:touch}
+#inner{width:100%}
+#inner img{width:100%;display:block;margin-bottom:6px;background:#fff;pointer-events:none}
+</style>
+<div id="wrap"><div id="bar"><button id="out">&minus;</button><button id="fit">Fit</button><button id="in">+</button><button id="fs">Fullscreen</button></div>
+<div id="box"><div id="inner">__IMGS__</div></div></div>
+<script>
+const box=document.getElementById('box'),inner=document.getElementById('inner');
+let zoom=100,dist=0,startZoom=100;
+function setZoom(z,cx,cy){
+  z=Math.max(100,Math.min(500,z));
+  const r=z/zoom, x=(box.scrollLeft+(cx??box.clientWidth/2))*r-(cx??box.clientWidth/2), y=(box.scrollTop+(cy??box.clientHeight/2))*r-(cy??box.clientHeight/2);
+  zoom=z; inner.style.width=zoom+'%'; box.scrollLeft=x; box.scrollTop=y;
+}
+const d=t=>Math.hypot(t[0].clientX-t[1].clientX,t[0].clientY-t[1].clientY);
+box.addEventListener('touchstart',e=>{if(e.touches.length==2){dist=d(e.touches);startZoom=zoom;}},{passive:true});
+box.addEventListener('touchmove',e=>{if(e.touches.length==2&&dist){e.preventDefault();
+  const rect=box.getBoundingClientRect();
+  const cx=(e.touches[0].clientX+e.touches[1].clientX)/2-rect.left, cy=(e.touches[0].clientY+e.touches[1].clientY)/2-rect.top;
+  setZoom(startZoom*d(e.touches)/dist,cx,cy);}},{passive:false});
+box.addEventListener('touchend',e=>{if(e.touches.length<2)dist=0;});
+box.addEventListener('wheel',e=>{if(e.ctrlKey){e.preventDefault();setZoom(zoom*(e.deltaY<0?1.1:0.9),e.offsetX,e.offsetY);}},{passive:false});
+document.getElementById('in').onclick=()=>setZoom(zoom*1.3);
+document.getElementById('out').onclick=()=>setZoom(zoom/1.3);
+document.getElementById('fit').onclick=()=>setZoom(100);
+document.getElementById('fs').onclick=()=>{const w=document.getElementById('wrap');
+  if(document.fullscreenElement){document.exitFullscreen()}else if(w.requestFullscreen){w.requestFullscreen()}};
+</script>
+""".replace("__IMGS__", imgs)
+    components.html(html, height=height, scrolling=False)
+
+
 def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company_name: str, file_name: str):
     with st.expander(f"{company_name} Price List", expanded=bool(file_name)):
         path = _price_list_path(company_id, file_name) if file_name else None
@@ -3227,10 +3266,11 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
                     import fitz
 
                     with fitz.open(stream=data, filetype="pdf") as doc:
-                        page_count = len(doc)
-                        for page_index in range(page_count):
-                            pix = doc[page_index].get_pixmap(dpi=110)
-                            st.image(pix.tobytes("png"), caption=f"Page {page_index + 1} of {page_count}")
+                        pages_b64 = [
+                            base64.b64encode(page.get_pixmap(dpi=150).tobytes("png")).decode()
+                            for page in doc
+                        ]
+                    _render_zoomable_pages(pages_b64, key=company_id)
                 elif suffix in {".png", ".jpg", ".jpeg"}:
                     st.image(data)
                 elif suffix == ".csv":
