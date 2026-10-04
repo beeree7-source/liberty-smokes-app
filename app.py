@@ -3556,6 +3556,10 @@ def page_inbox(pg: SyncPostgrestClient):
                 f"{message.get('date') or 'Date unavailable'}"
             )
             st.text(str(message.get("body") or "(No plain-text message body.)"))
+            if message.get("links"):
+                st.markdown("**Links in this email**")
+                for link_url in message["links"]:
+                    st.markdown(f"- [{link_url[:90]}]({link_url})")
             if is_unread and st.button("Mark as read", key=f"inbox_read_{key_suffix}"):
                 save_inbox_read_ids(pg, read_ids | {uid})
                 st.rerun()
@@ -5343,16 +5347,25 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
                 if not any(kw in norm_from for kw in keywords):
                     continue
             body_parts = []
+            link_source = []
             for part in parsed_message.walk():
-                if part.get_content_type() != "text/plain" or part.get_content_disposition() == "attachment":
+                if part.get_content_disposition() == "attachment" or part.get_content_type() not in ("text/plain", "text/html"):
                     continue
                 try:
                     content = part.get_content()
                 except (LookupError, UnicodeDecodeError):
                     payload = part.get_payload(decode=True) or b""
                     content = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
-                if isinstance(content, str) and content.strip():
+                if not isinstance(content, str):
+                    continue
+                link_source.append(content)
+                if part.get_content_type() == "text/plain" and content.strip():
                     body_parts.append(content.strip())
+            links: list[str] = []
+            for url in re.findall(r"https?://[^\s\"'<>)\]]+", html.unescape("\n".join(link_source))):
+                url = url.rstrip(".,;:!")
+                if url not in links:
+                    links.append(url)
 
             header_message_id = str(parsed_message.get("Message-ID") or "").strip()
             messages.append(
@@ -5366,6 +5379,7 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
                     "subject": str(parsed_message.get("Subject") or ""),
                     "date": str(parsed_message.get("Date") or ""),
                     "body": "\n\n".join(body_parts)[:5000],
+                    "links": links[:20],
                 }
             )
         return messages
