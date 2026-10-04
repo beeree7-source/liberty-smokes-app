@@ -3455,6 +3455,16 @@ def page_ordering(pg: SyncPostgrestClient):
             height=180,
         )
 
+        att_gen = st.session_state.get("ordering_att_gen", 0)
+        sent_msg = st.session_state.pop("ordering_sent_msg", "")
+        if sent_msg:
+            st.success(sent_msg)
+        email_files = st.file_uploader(
+            "Attach files or images (optional)",
+            accept_multiple_files=True,
+            key=f"ordering_email_files_{selected_company_id}_{att_gen}",
+        )
+
         member_smtp = load_smtp_settings(pg)
         ordering_smtp = load_ordering_smtp_settings(pg)
         rep_smtp_configured = all(ordering_smtp.get(k) for k in ("host", "from_addr", "password"))
@@ -3491,10 +3501,25 @@ def page_ordering(pg: SyncPostgrestClient):
                         email_body,
                         security=smtp.get("security", "SSL"),
                         from_addr=smtp.get("from_addr", ""),
+                        attachments=_uploads_to_attachments(email_files),
                     )
-                    st.success(f"Email sent to {rep_name or selected_company.get('company', '')} ({normalized_rep_email}).")
+                    st.session_state["ordering_att_gen"] = att_gen + 1
+                    st.session_state["ordering_sent_msg"] = f"Email sent to {rep_name or selected_company.get('company', '')} ({normalized_rep_email})."
+                    st.rerun()
                 except Exception as exc:
                     st.error(f"Failed to send email: {exc}")
+
+
+def _uploads_to_attachments(uploads) -> list[dict]:
+    return [
+        {
+            "filename": str(getattr(u, "name", "attachment.bin") or "attachment.bin"),
+            "mime_type": str(getattr(u, "type", "") or ""),
+            "content": u.getvalue(),
+        }
+        for u in (uploads or [])
+        if u is not None and u.getvalue()
+    ]
 
 
 def page_inbox(pg: SyncPostgrestClient):
@@ -3569,6 +3594,13 @@ def page_inbox(pg: SyncPostgrestClient):
                 st.rerun()
 
             reply_text = st.text_area("Reply", key=f"inbox_reply_text_{key_suffix}", height=140)
+            reply_files = st.file_uploader(
+                "Attach files or images (optional)",
+                accept_multiple_files=True,
+                key=f"inbox_reply_files_{key_suffix}_{st.session_state.get('inbox_att_gen', 0)}",
+            )
+            if st.session_state.pop(f"inbox_sent_{key_suffix}", ""):
+                st.success("Reply sent.")
             if st.button("Send reply", key=f"inbox_reply_send_{key_suffix}", type="primary"):
                 reply_to = message.get("reply_to") or message["from_email"]
                 if not smtp_ready:
@@ -3589,9 +3621,12 @@ def page_inbox(pg: SyncPostgrestClient):
                             from_addr=smtp.get("from_addr", ""),
                             in_reply_to=message.get("message_id", ""),
                             references=message.get("references", ""),
+                            attachments=_uploads_to_attachments(reply_files),
                         )
                         save_inbox_read_ids(pg, read_ids | {uid})
-                        st.success(f"Reply sent to {reply_to}.")
+                        st.session_state["inbox_att_gen"] = st.session_state.get("inbox_att_gen", 0) + 1
+                        st.session_state[f"inbox_sent_{key_suffix}"] = reply_to
+                        st.rerun()
                     except Exception as exc:
                         st.error(f"Failed to send reply: {exc}")
 
