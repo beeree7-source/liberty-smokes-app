@@ -3573,9 +3573,7 @@ def _render_inbox_tab(pg: SyncPostgrestClient, source: str):
             for c in load_ordering_companies(pg)
         }
     top_right.metric("Unread", len(unread))
-    if unread and st.button("Mark all as read", key=f"inbox_mark_all_{source}"):
-        save_inbox_read_ids(pg, read_ids | {m["uid"] for m in messages})
-        st.rerun()
+    unread_ids = {m["uid"] for m in unread}
 
     if not messages:
         st.info("No messages from your members yet." if is_members else "No messages from your sales reps yet.")
@@ -3585,22 +3583,137 @@ def _render_inbox_tab(pg: SyncPostgrestClient, source: str):
     reply_smtp_choice = "Member SMTP (current default)"
     if all(rep_smtp.get(k) for k in ("host", "from_addr", "password")):
         reply_smtp_choice = st.radio(
-            "Reply using",
+            "Send using",
             ["Member SMTP (current default)", "Sales Rep SMTP profile"],
             key=f"inbox_reply_sender_{source}",
             horizontal=True,
         )
     smtp = rep_smtp if reply_smtp_choice == "Sales Rep SMTP profile" else load_smtp_settings(pg)
     smtp_ready = all(smtp.get(k) for k in ("host", "port", "from_addr", "password"))
+    imap_settings = load_ordering_imap_settings(pg)
 
-    for index, message in enumerate(messages):
+    def _skey(m: dict) -> str:
+        return hashlib.sha1((source + m["uid"]).encode("utf-8")).hexdigest()[:10]
+
+    filter_col, search_col = st.columns([1, 2])
+    show = filter_col.radio("Show", ["All", "Unread"], horizontal=True, key=f"inbox_show_{source}")
+    query = search_col.text_input(
+        "Search", key=f"inbox_search_{source}", placeholder="Search sender, subject or text"
+    ).strip().lower()
+    visible = []
+    for m in messages:
+        if show == "Unread" and m["uid"] not in unread_ids:
+            continue
+        if query:
+            haystack = " ".join(
+                [str(m.get("from_name") or ""), m["from_email"], str(m.get("subject") or ""), str(m.get("body") or "")]
+            ).lower()
+            if query not in haystack:
+                continue
+        visible.append(m)
+
+    def _set_selection(value: bool):
+        for m in visible:
+            st.session_state[f"inbox_sel_{_skey(m)}"] = value
+
+    selected = [m for m in visible if st.session_state.get(f"inbox_sel_{_skey(m)}")]
+
+    def _clear_selection():
+        for m in messages:
+            st.session_state.pop(f"inbox_sel_{_skey(m)}", None)
+
+    def _forward_form(items: list[dict], form_key: str):
+        fwd_to = st.text_input("To (separate several addresses with commas)", key=f"fwd_to_{form_key}")
+        fwd_note = st.text_area("Add a note (optional)", key=f"fwd_note_{form_key}", height=90)
+        with_att = st.checkbox("Include original attachments", value=True, key=f"fwd_att_{form_key}")
+        if st.button("Send forward", key=f"fwd_send_{form_key}", type="primary"):
+            recipients = [a for a in (parseaddr(x)[1] for x in re.split(r"[,;]", fwd_to)) if "@" in a]
+            if not smtp_ready:
+                st.warning("Configure the selected SMTP profile in Settings before sending.")
+            elif not recipients:
+                st.warning("Enter at least one valid email address.")
+            else:
+                try:
+                    for item in items:
+                        subj = str(item.get("subject") or "(no subject)")
+                        text = (
+                            (fwd_note.strip() + "\n\n" if fwd_note.strip() else "")
+                            + "---------- Forwarded message ----------\n"
+                            + f"From: {item.get('from_name') or ''} <{item['from_email']}>\n"
+                            + f"Date: {item.get('date') or ''}\n"
+                            + f"Subject: {subj}\n\n"
+                            + str(item.get("body") or "")
+                        )
+                        atts = []
+                        if with_att and str(item.get("imap_uid") or "").isdigit():
+                            atts = fetch_inbox_attachments(imap_settings, item["imap_uid"])
+                        for addr in recipients:
+                            send_email(
+                                smtp["host"], int(smtp["port"]), smtp.get("username", ""), smtp.get("password", ""),
+                                addr,
+                                subj if subj.lower().startswith("fwd:") else f"Fwd: {subj}",
+                                text,
+                                security=smtp.get("security", "SSL"),
+                                from_addr=smtp.get("from_addr", ""),
+                                attachments=atts,
+                            )
+                    st.session_state["inbox_flash"] = f"Forwarded {len(items)} message(s) to {', '.join(recipients)}."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to forward: {exc}")
+
+    def _delete(items: list[dict]):
+        try:
+            note = delete_inbox_messages(imap_settings, [i.get("imap_uid", "") for i in items])
+        except Exception as exc:
+            st.error(f"Could not delete: {exc}")
+            return
+        _clear_selection()
+        st.session_state["inbox_nonce"] = int(st.session_state.get("inbox_nonce", 0)) + 1
+        st.session_state["inbox_flash"] = f"{len(items)} message(s): {note}"
+        st.rerun()
+
+    flash = st.session_state.pop("inbox_flash", "")
+    if flash:
+        st.success(flash)
+
+    bar = st.columns([1.2, 1.4, 1.2, 1.3, 1, 1, 1.1])
+    bar[0].button("Select all", key=f"inbox_selall_{source}", on_click=_set_selection, args=(True,))
+    bar[1].button("Clear selection", key=f"inbox_selnone_{source}", on_click=_set_selection, args=(False,))
+    bar[6].caption(f"{len(selected)} selected")
+    has_sel = bool(selected)
+    if bar[2].button("Mark read", key=f"inbox_bulk_read_{source}", disabled=not has_sel):
+        save_inbox_read_ids(pg, read_ids | {m["uid"] for m in selected})
+        _clear_selection()
+        st.rerun()
+    if bar[3].button("Mark unread", key=f"inbox_bulk_unread_{source}", disabled=not has_sel):
+        save_inbox_read_ids(pg, read_ids - {m["uid"] for m in selected})
+        _clear_selection()
+        st.rerun()
+    with bar[4].popover("Forward", disabled=not has_sel):
+        _forward_form(selected, f"bulk_{source}")
+    with bar[5].popover("Delete", disabled=not has_sel):
+        st.warning(f"Delete {len(selected)} message(s)? They go to the mail server's Trash when available.")
+        if st.button("Yes, delete", key=f"inbox_bulk_del_{source}", type="primary"):
+            _delete(selected)
+    if unread and st.button("Mark all as read", key=f"inbox_mark_all_{source}"):
+        save_inbox_read_ids(pg, read_ids | {m["uid"] for m in messages})
+        st.rerun()
+
+    if not visible:
+        st.info("No messages match.")
+        return
+
+    for index, message in enumerate(visible):
         uid = message["uid"]
-        is_unread = uid in {m["uid"] for m in unread}
-        key_suffix = hashlib.sha1((source + uid).encode("utf-8")).hexdigest()[:10]
+        is_unread = uid in unread_ids
+        key_suffix = _skey(message)
         company = name_by_email.get(message["from_email"], "")
         subject = str(message.get("subject") or "(no subject)")
+        check_col, body_col = st.columns([0.06, 0.94], vertical_alignment="top")
+        check_col.checkbox("Select", key=f"inbox_sel_{key_suffix}", label_visibility="collapsed")
         label = f"{'🔵 ' if is_unread else ''}{company + ' — ' if company else ''}{subject}"
-        with st.expander(label, expanded=is_unread and index == 0):
+        with body_col.expander(label, expanded=False):
             st.caption(
                 f"From: {message.get('from_name') or message['from_email']} <{message['from_email']}> · "
                 f"{message.get('date') or 'Date unavailable'}"
@@ -3610,9 +3723,21 @@ def _render_inbox_tab(pg: SyncPostgrestClient, source: str):
                 st.markdown("**Links in this email**")
                 for link_url in message["links"]:
                     st.markdown(f"- [{link_url[:90]}]({link_url})")
-            if is_unread and st.button("Mark as read", key=f"inbox_read_{key_suffix}"):
-                save_inbox_read_ids(pg, read_ids | {uid})
+
+            actions = st.columns(4)
+            if is_unread:
+                if actions[0].button("Mark as read", key=f"inbox_read_{key_suffix}"):
+                    save_inbox_read_ids(pg, read_ids | {uid})
+                    st.rerun()
+            elif actions[0].button("Mark as unread", key=f"inbox_unread_{key_suffix}"):
+                save_inbox_read_ids(pg, read_ids - {uid})
                 st.rerun()
+            with actions[1].popover("Forward"):
+                _forward_form([message], f"one_{key_suffix}")
+            with actions[2].popover("Delete"):
+                st.warning("Delete this message?")
+                if st.button("Yes, delete", key=f"inbox_del_{key_suffix}", type="primary"):
+                    _delete([message])
 
             reply_text = st.text_area("Reply", key=f"inbox_reply_text_{key_suffix}", height=140)
             reply_files = st.file_uploader(
@@ -3650,7 +3775,6 @@ def _render_inbox_tab(pg: SyncPostgrestClient, source: str):
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Failed to send reply: {exc}")
-
 
 def load_drink_catalog(pg: SyncPostgrestClient) -> list[dict]:
     rows = _load_json_list_setting(pg, DRINK_CATALOG_KEY)
@@ -5346,6 +5470,115 @@ def _ordering_rep_keywords(pg: SyncPostgrestClient) -> tuple[str, ...]:
     return tuple(sorted(k for k in keywords if k))
 
 
+def _imap_uid_of(prefix: bytes) -> bytes:
+    found = re.search(rb"UID\s+(\d+)", prefix)
+    return found.group(1) if found else prefix.split()[0]
+
+
+def _imap_open(settings: dict, readonly: bool = False):
+    host = str(settings["host"]).strip()
+    port = int(settings.get("port") or 993)
+    security = str(settings.get("security") or "SSL").upper()
+    if security == "SSL":
+        mailbox = imaplib.IMAP4_SSL(host, port, timeout=20)
+    elif security == "STARTTLS":
+        mailbox = imaplib.IMAP4(host, port, timeout=20)
+        mailbox.starttls()
+    else:
+        raise ValueError("IMAP security must be SSL or STARTTLS.")
+    try:
+        mailbox.login(str(settings["username"]).strip(), str(settings["password"]))
+        status, _ = mailbox.select("INBOX", readonly=readonly)
+        if status != "OK":
+            raise RuntimeError("Could not open the inbox.")
+    except Exception:
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+        raise
+    return mailbox
+
+
+def _imap_trash_folder(mailbox) -> str:
+    try:
+        status, rows = mailbox.list()
+    except Exception:
+        return ""
+    names = []
+    for row in rows or []:
+        if not isinstance(row, bytes):
+            continue
+        found = re.match(r"\((?P<flags>[^)]*)\)\s+\S+\s+(?P<name>.+)$", row.decode("utf-8", errors="replace"))
+        if not found:
+            continue
+        name = found.group("name").strip().strip('"')
+        names.append(name)
+        if "\\Trash" in found.group("flags"):
+            return name
+    for candidate in ("Trash", "INBOX.Trash", "Deleted Items", "Deleted Messages", "[Gmail]/Trash"):
+        if candidate in names:
+            return candidate
+    return ""
+
+
+def delete_inbox_messages(settings: dict, imap_uids: list[str]) -> str:
+    uids = [str(u) for u in imap_uids if str(u).isdigit()]
+    if not uids:
+        return ""
+    mailbox = _imap_open(settings)
+    try:
+        uid_set = ",".join(uids)
+        trash = _imap_trash_folder(mailbox)
+        moved = False
+        if trash:
+            status, _ = mailbox.uid("COPY", uid_set, f'"{trash}"')
+            moved = status == "OK"
+        status, _ = mailbox.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+        if status != "OK":
+            raise RuntimeError("The mail server refused to delete the message(s).")
+        try:
+            status, _ = mailbox.uid("EXPUNGE", uid_set)
+            if status != "OK":
+                mailbox.expunge()
+        except Exception:
+            mailbox.expunge()
+        return "Moved to Trash." if moved else "Deleted."
+    finally:
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
+
+def fetch_inbox_attachments(settings: dict, imap_uid: str) -> list[dict]:
+    mailbox = _imap_open(settings, readonly=True)
+    try:
+        status, parts = mailbox.uid("FETCH", str(imap_uid), "(BODY.PEEK[])")
+        raw = next((p[1] for p in parts or [] if isinstance(p, tuple) and isinstance(p[1], bytes)), b"")
+    finally:
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+    if not raw:
+        return []
+    parsed = BytesParser(policy=policy.default).parsebytes(raw)
+    out = []
+    for part in parsed.walk():
+        if part.get_content_disposition() != "attachment":
+            continue
+        content = part.get_payload(decode=True) or b""
+        if content:
+            out.append(
+                {
+                    "filename": part.get_filename() or "attachment.bin",
+                    "mime_type": part.get_content_type(),
+                    "content": content,
+                }
+            )
+    return out
+
 def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limit: int = 25) -> list[dict]:
     # Entries without "@" are company/brand keywords matched inside the sender address.
     keywords = sorted({str(a).strip().lower() for a in allowed_addresses if a and "@" not in str(a)})
@@ -5379,36 +5612,36 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
 
         if len(allowed) > 30:
             # Too many addresses for one IMAP OR query: scan recent senders and filter locally.
-            status, results = mailbox.search(None, "ALL")
+            status, results = mailbox.uid("SEARCH", None, "ALL")
             recent = (results[0].split() if status == "OK" and results and results[0] else [])[-400:]
             message_ids = []
             for start in range(0, len(recent), 100):
                 chunk = recent[start:start + 100]
-                status, parts = mailbox.fetch(b",".join(chunk).decode(), "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+                status, parts = mailbox.uid("FETCH", b",".join(chunk).decode(), "(BODY.PEEK[HEADER.FIELDS (FROM)])")
                 if status != "OK":
                     continue
                 for part in parts:
                     if isinstance(part, tuple) and isinstance(part[1], bytes):
                         sender = parseaddr(part[1].decode("utf-8", errors="replace").partition(":")[2].strip())[1].lower()
                         if sender in allowed:
-                            message_ids.append(part[0].split()[0])
+                            message_ids.append(_imap_uid_of(part[0]))
         else:
             criteria = [f'FROM "{address}"' for address in sorted(allowed)]
             criteria += [f'FROM "{kw}"' for kw in keywords if re.fullmatch(r"[a-z0-9.\-]+", kw)]
             query = criteria[-1]
             for criterion in reversed(criteria[:-1]):
                 query = f"OR {criterion} {query}"
-            status, results = mailbox.search(None, query)
+            status, results = mailbox.uid("SEARCH", None, query)
             message_ids = results[0].split() if status == "OK" and results and results[0] else []
 
         ordered_ids = sorted(message_ids, key=lambda value: int(value), reverse=True)[:max(1, int(limit))]
         fetched: dict[bytes, bytes] = {}
         if ordered_ids:
-            status, parts = mailbox.fetch(b",".join(ordered_ids).decode(),             "(BODY.PEEK[]<0.60000>)")
+            status, parts = mailbox.uid("FETCH", b",".join(ordered_ids).decode(), "(BODY.PEEK[]<0.60000>)")
             if status == "OK":
                 for part in parts:
                     if isinstance(part, tuple) and isinstance(part[1], bytes):
-                        fetched[part[0].split()[0]] = part[1]
+                        fetched[_imap_uid_of(part[0])] = part[1]
 
         messages = []
         for message_id in ordered_ids:
@@ -5447,6 +5680,7 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
             messages.append(
                 {
                     "uid": header_message_id or f"imap-{message_id.decode()}",
+                    "imap_uid": message_id.decode(),
                     "message_id": header_message_id,
                     "references": str(parsed_message.get("References") or "").strip(),
                     "reply_to": parseaddr(str(parsed_message.get("Reply-To") or ""))[1].strip().lower(),
