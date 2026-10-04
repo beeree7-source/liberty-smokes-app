@@ -13,6 +13,8 @@ import re
 import socket
 from pathlib import Path
 import smtplib
+import threading
+import time
 import uuid
 from email import policy
 from email.message import EmailMessage
@@ -1995,23 +1997,22 @@ NAV_SHOW_POS_KEY = "nav_show_pos_v1"
 NAV_SHOW_SCANNER_KEY = "nav_show_scanner_v1"
 NAV_SHOW_SEATS_KEY = "nav_show_seats_v1"
 NAV_SHOW_MEMBERS_KEY = "nav_show_members_v1"
-NAV_SHOW_CAMPAIGNS_KEY = "nav_show_campaigns_v1"
 NAV_SHOW_SALES_LEDGER_KEY = "nav_show_sales_ledger_v1"
 NAV_SHOW_SCHEDULE_KEY = "nav_show_schedule_v1"
+NAV_SHOW_EVENTS_KEY = "nav_show_events_v1"
 NAV_SHOW_ORDERING_KEY = "nav_show_ordering_v1"
+NAV_SHOW_INBOX_KEY = "nav_show_inbox_v1"
 NAV_PAGE_SETTING_KEYS = {
     "Seats": NAV_SHOW_SEATS_KEY,
     "Members": NAV_SHOW_MEMBERS_KEY,
-    "Campaigns": NAV_SHOW_CAMPAIGNS_KEY,
     "Sales Ledger": NAV_SHOW_SALES_LEDGER_KEY,
     "Schedule": NAV_SHOW_SCHEDULE_KEY,
+    "Events": NAV_SHOW_EVENTS_KEY,
     "Ordering": NAV_SHOW_ORDERING_KEY,
+    "Inbox": NAV_SHOW_INBOX_KEY,
     "POS": NAV_SHOW_POS_KEY,
     "Scanner": NAV_SHOW_SCANNER_KEY,
 }
-MEMBER_MARGIN_SECTION_KEY = "members_show_margin_section_v1"
-MEMBER_DRINK_TRACKER_SECTION_KEY = "members_show_drink_tracker_section_v1"
-MEMBER_MASS_TEXT_SECTION_KEY = "members_show_mass_text_section_v1"
 DRINK_CATALOG_KEY = "drink_catalog_v1"
 
 CIGARPOS_BASE_URL_KEY = "cigarpos_base_url"
@@ -2025,14 +2026,22 @@ EMAIL_REMINDERS_AUTO_ENABLED_KEY = "email_reminders_auto_enabled_v1"
 EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY = "email_reminders_auto_interval_min_v1"
 EMAIL_REMINDERS_AUTO_LAST_RUN_KEY = "email_reminders_auto_last_run_v1"
 EMAIL_REMINDERS_AUTO_LAST_RESULT_KEY = "email_reminders_auto_last_result_v1"
-SCHEDULE_MONTHLY_REMINDERS_KEY = "schedule_monthly_reminders_v1"
 SCHEDULE_STORE_EVENTS_KEY = "schedule_store_events_v1"
+SCHEDULE_WEEKLY_SHIFTS_KEY = "schedule_weekly_employee_shifts_v1"
 SCHEDULE_EMAIL_TO_KEY = "schedule_email_to_v1"
+SCHEDULE_EMPLOYEES_KEY = "schedule_employees_v1"
+SCHEDULE_STAFF_AUTO_ENABLED_KEY = "schedule_staff_auto_enabled_v1"
+SCHEDULE_STAFF_AUTO_DAY_KEY = "schedule_staff_auto_day_v1"
+SCHEDULE_STAFF_LAST_SENT_KEY = "schedule_staff_last_sent_v1"
 SCHEDULE_EMAIL_AUTO_ENABLED_KEY = "schedule_email_auto_enabled_v1"
+SCHEDULE_EMAIL_MEMBERS_KEY = "schedule_email_include_members_v1"
+SCHEDULE_EMAIL_LIST_KEY = "schedule_email_include_list_v1"
+PUBLIC_MAILING_LIST_KEY = "public_mailing_list_v1"
 SCHEDULE_EMAIL_AUTO_INTERVAL_MIN_KEY = "schedule_email_auto_interval_min_v1"
 SCHEDULE_EMAIL_AUTO_LAST_RUN_KEY = "schedule_email_auto_last_run_v1"
 SCHEDULE_EMAIL_AUTO_LAST_RESULT_KEY = "schedule_email_auto_last_result_v1"
 ORDERING_REPS_KEY = "ordering_sales_reps_v1"
+ORDERING_REPS_MIGRATED_KEY = "ordering_sales_reps_migrated_v1"
 ORDERING_COMPANIES_KEY = "ordering_companies_v1"
 
 
@@ -2059,25 +2068,6 @@ def _setting_bool(value, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _next_monthly_due_date(day_of_month: int, today: datetime.date | None = None) -> datetime.date:
-    today = today or datetime.date.today()
-    year = today.year
-    month = today.month
-
-    current_month_day = min(int(day_of_month), calendar.monthrange(year, month)[1])
-    due_date = datetime.date(year, month, current_month_day)
-    if due_date >= today:
-        return due_date
-
-    if month == 12:
-        month = 1
-        year += 1
-    else:
-        month += 1
-    next_month_day = min(int(day_of_month), calendar.monthrange(year, month)[1])
-    return datetime.date(year, month, next_month_day)
 
 
 def _format_time_12h(value: str) -> str:
@@ -2153,55 +2143,54 @@ def _format_datetime_12h(value: str) -> str:
     return raw
 
 
-def load_monthly_schedule_reminders(pg: SyncPostgrestClient) -> list[dict]:
-    rows = _load_json_list_setting(pg, SCHEDULE_MONTHLY_REMINDERS_KEY)
-    out = []
-    for row in rows:
-        title = str(row.get("title") or "").strip()
-        if not title:
-            continue
-        try:
-            day_of_month = int(row.get("day_of_month") or 1)
-        except Exception:
-            day_of_month = 1
-        day_of_month = max(1, min(31, day_of_month))
-        notes = str(row.get("notes") or "").strip()
-        reminder_id = str(row.get("id") or hashlib.sha1(f"{title.lower()}|{day_of_month}".encode("utf-8")).hexdigest()[:12])
-        out.append(
-            {
-                "id": reminder_id,
-                "title": title,
-                "day_of_month": day_of_month,
-                "notes": notes,
-                "enabled": _setting_bool(row.get("enabled"), True),
-            }
-        )
-    return sorted(out, key=lambda item: (int(item.get("day_of_month") or 1), str(item.get("title") or "").lower()))
+WEEKLY_SHIFT_SLOTS = [
+    {"day": day, "shift": shift, "hours": hours}
+    for day in ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday")
+    for shift, hours in (("Opening", "10:00 AM - 6:00 PM"), ("Closing", "6:00 PM - 10:00 PM"))
+] + [
+    {"day": day, "shift": shift, "hours": hours}
+    for day in ("Friday", "Saturday")
+    for shift, hours in (("Opening", "10:00 AM - 6:00 PM"), ("Closing", "6:00 PM - 12:00 AM"))
+]
 
 
-def save_monthly_schedule_reminders(pg: SyncPostgrestClient, reminders: list[dict]):
-    clean = []
-    for row in reminders or []:
-        title = str(row.get("title") or "").strip()
-        if not title:
-            continue
-        try:
-            day_of_month = int(row.get("day_of_month") or 1)
-        except Exception:
-            day_of_month = 1
-        day_of_month = max(1, min(31, day_of_month))
-        notes = str(row.get("notes") or "").strip()
-        reminder_id = str(row.get("id") or hashlib.sha1(f"{title.lower()}|{day_of_month}".encode("utf-8")).hexdigest()[:12])
-        clean.append(
-            {
-                "id": reminder_id,
-                "title": title,
-                "day_of_month": day_of_month,
-                "notes": notes,
-                "enabled": _setting_bool(row.get("enabled"), True),
-            }
-        )
-    _save_json_list_setting(pg, SCHEDULE_MONTHLY_REMINDERS_KEY, clean)
+def load_weekly_employee_shifts(pg: SyncPostgrestClient) -> list[dict]:
+    saved = _load_json_list_setting(pg, SCHEDULE_WEEKLY_SHIFTS_KEY)
+    saved_by_slot = {
+        (str(row.get("day") or ""), str(row.get("shift") or "")): row
+        for row in saved
+    }
+    return [
+        {
+            "Day": slot["day"],
+            "Shift": slot["shift"],
+            "Hours": str(saved_by_slot.get((slot["day"], slot["shift"]), {}).get("hours") or "").strip()
+            or slot["hours"],
+            "Employee": str(saved_by_slot.get((slot["day"], slot["shift"]), {}).get("employee") or ""),
+        }
+        for slot in WEEKLY_SHIFT_SLOTS
+    ]
+
+
+def save_weekly_employee_shifts(pg: SyncPostgrestClient, rows: list[dict]):
+    if hasattr(rows, "to_dict"):
+        rows = rows.to_dict("records")
+    by_slot = {
+        (str(row.get("Day") or ""), str(row.get("Shift") or "")): row
+        for row in rows
+        if isinstance(row, dict)
+    }
+    clean = [
+        {
+            "day": slot["day"],
+            "shift": slot["shift"],
+            "hours": str(by_slot.get((slot["day"], slot["shift"]), {}).get("Hours") or "").strip()
+            or slot["hours"],
+            "employee": str(by_slot.get((slot["day"], slot["shift"]), {}).get("Employee") or "").strip(),
+        }
+        for slot in WEEKLY_SHIFT_SLOTS
+    ]
+    _save_json_list_setting(pg, SCHEDULE_WEEKLY_SHIFTS_KEY, clean)
 
 
 def load_store_events_schedule(pg: SyncPostgrestClient) -> list[dict]:
@@ -2288,93 +2277,6 @@ def save_store_events_schedule(pg: SyncPostgrestClient, events: list[dict]):
     _save_json_list_setting(pg, SCHEDULE_STORE_EVENTS_KEY, clean)
 
 
-def load_ordering_sales_reps(pg: SyncPostgrestClient) -> list[dict]:
-    rows = _load_json_list_setting(pg, ORDERING_REPS_KEY)
-    out = []
-    for row in rows:
-        name = str(row.get("name") or "").strip()
-        email = parseaddr(str(row.get("email") or "").strip())[1].strip()
-        if not name:
-            continue
-        rep_id = str(row.get("id") or hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12])
-        out.append(
-            {
-                "id": rep_id,
-                "name": name,
-                "email": email,
-                "phone": str(row.get("phone") or "").strip(),
-                "company": str(row.get("company") or "").strip(),
-                "brands": str(row.get("brands") or "").strip(),
-                "active": _setting_bool(row.get("active"), True),
-            }
-        )
-    return sorted(out, key=lambda item: str(item.get("name") or "").lower())
-
-
-def save_ordering_sales_reps(pg: SyncPostgrestClient, reps: list[dict]):
-    clean = []
-    for row in reps or []:
-        name = str(row.get("name") or "").strip()
-        email = parseaddr(str(row.get("email") or "").strip())[1].strip()
-        if not name:
-            continue
-        rep_id = str(row.get("id") or hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12])
-        clean.append(
-            {
-                "id": rep_id,
-                "name": name,
-                "email": email,
-                "phone": str(row.get("phone") or "").strip(),
-                "company": str(row.get("company") or "").strip(),
-                "brands": str(row.get("brands") or "").strip(),
-                "active": _setting_bool(row.get("active"), True),
-            }
-        )
-    _save_json_list_setting(pg, ORDERING_REPS_KEY, clean)
-
-
-def upsert_company_reps_into_sales_reps(companies: list[dict], existing_reps: list[dict]) -> list[dict]:
-    updated = [dict(rep) for rep in (existing_reps or []) if isinstance(rep, dict)]
-
-    for company in companies or []:
-        rep_name = str((company or {}).get("rep_name") or "").strip()
-        rep_email = parseaddr(str((company or {}).get("rep_email") or "").strip())[1].strip()
-        if not rep_name or not rep_email:
-            continue
-
-        match_idx = -1
-        target_name = rep_name.lower()
-        target_email = rep_email.lower()
-        for idx, rep in enumerate(updated):
-            existing_name = str((rep or {}).get("name") or "").strip().lower()
-            existing_email = parseaddr(str((rep or {}).get("email") or "").strip())[1].strip().lower()
-            if (existing_email and existing_email == target_email) or (existing_name and existing_name == target_name):
-                match_idx = idx
-                break
-
-        if match_idx >= 0:
-            row = dict(updated[match_idx])
-            row["name"] = rep_name
-            row["email"] = rep_email
-            row["company"] = str((company or {}).get("company") or "").strip()
-            row["active"] = True
-            row["id"] = str(row.get("id") or hashlib.sha1(rep_name.lower().encode("utf-8")).hexdigest()[:12])
-            updated[match_idx] = row
-        else:
-            updated.append(
-                {
-                    "id": hashlib.sha1(rep_name.lower().encode("utf-8")).hexdigest()[:12],
-                    "name": rep_name,
-                    "email": rep_email,
-                    "phone": "",
-                    "company": str((company or {}).get("company") or "").strip(),
-                    "active": True,
-                }
-            )
-
-    return updated
-
-
 def _clean_ordering_item_row(row: dict) -> dict:
     import re
 
@@ -2433,7 +2335,61 @@ def _clean_ordering_item_row(row: dict) -> dict:
     }
 
 
+def _migrate_ordering_sales_reps_to_companies(pg: SyncPostgrestClient):
+    if _setting_bool(get_setting(pg, ORDERING_REPS_MIGRATED_KEY)):
+        return
+
+    companies = _load_json_list_setting(pg, ORDERING_COMPANIES_KEY)
+    reps = _load_json_list_setting(pg, ORDERING_REPS_KEY)
+    companies_changed = False
+
+    for company in companies:
+        company_name = str(company.get("company") or company.get("name") or "").strip().casefold()
+        company_email = parseaddr(
+            str(company.get("rep_email") or company.get("email") or "").strip()
+        )[1].strip().casefold()
+        matching_reps = [
+            rep for rep in reps
+            if company_name
+            and str(rep.get("company") or "").strip().casefold() == company_name
+        ]
+        matching_by_email = [
+            rep for rep in matching_reps
+            if company_email
+            and parseaddr(str(rep.get("email") or "").strip())[1].strip().casefold()
+            == company_email
+        ]
+        if len(matching_by_email) == 1:
+            matching_reps = matching_by_email
+        if not matching_reps and company_email:
+            matching_reps = [
+                rep for rep in reps
+                if parseaddr(str(rep.get("email") or "").strip())[1].strip().casefold()
+                == company_email
+            ]
+        if len(matching_reps) != 1:
+            continue
+
+        rep = matching_reps[0]
+        for company_key, rep_key in (
+            ("rep_name", "name"),
+            ("rep_email", "email"),
+            ("rep_phone", "phone"),
+            ("rep_brands", "brands"),
+        ):
+            if not str(company.get(company_key) or "").strip():
+                value = str(rep.get(rep_key) or "").strip()
+                if value:
+                    company[company_key] = value
+                    companies_changed = True
+
+    if companies_changed:
+        save_ordering_companies(pg, companies)
+    save_setting(pg, ORDERING_REPS_MIGRATED_KEY, "true")
+
+
 def load_ordering_companies(pg: SyncPostgrestClient) -> list[dict]:
+    _migrate_ordering_sales_reps_to_companies(pg)
     rows = _load_json_list_setting(pg, ORDERING_COMPANIES_KEY)
     out = []
     for row in rows:
@@ -2458,8 +2414,11 @@ def load_ordering_companies(pg: SyncPostgrestClient) -> list[dict]:
                 "company": company,
                 "rep_name": rep_name,
                 "rep_email": rep_email,
+                "rep_phone": str(row.get("rep_phone") or "").strip(),
+                "rep_brands": str(row.get("rep_brands") or "").strip(),
                 "ordering_url": str(row.get("ordering_url") or "").strip(),
                 "payment_terms": str(row.get("payment_terms") or "").strip(),
+                "price_list_file": str(row.get("price_list_file") or "").strip(),
                 "active": _setting_bool(row.get("active"), True),
                 "source_file": source_file,
                 "order_note": order_note,
@@ -2492,8 +2451,11 @@ def save_ordering_companies(pg: SyncPostgrestClient, companies: list[dict]):
                 "company": company,
                 "rep_name": rep_name,
                 "rep_email": rep_email,
+                "rep_phone": str((row or {}).get("rep_phone") or "").strip(),
+                "rep_brands": str((row or {}).get("rep_brands") or "").strip(),
                 "ordering_url": str((row or {}).get("ordering_url") or "").strip(),
                 "payment_terms": str((row or {}).get("payment_terms") or "").strip(),
+                "price_list_file": str((row or {}).get("price_list_file") or "").strip(),
                 "active": _setting_bool((row or {}).get("active"), True),
                 "source_file": source_file,
                 "order_note": order_note,
@@ -2501,40 +2463,6 @@ def save_ordering_companies(pg: SyncPostgrestClient, companies: list[dict]):
             }
         )
     _save_json_list_setting(pg, ORDERING_COMPANIES_KEY, clean)
-
-
-def upsert_ordering_company_rep(pg: SyncPostgrestClient, company_name: str, rep_name: str, rep_email: str):
-    company_name = str(company_name or "").strip()
-    if not company_name:
-        return
-
-    companies = load_ordering_companies(pg)
-    updated = []
-    company_found = False
-    for company in companies:
-        row = dict(company)
-        if str(row.get("company") or "").strip().casefold() == company_name.casefold():
-            row["rep_name"] = rep_name
-            row["rep_email"] = rep_email
-            company_found = True
-        updated.append(row)
-
-    if not company_found:
-        updated.append(
-            {
-                "id": hashlib.sha1(company_name.lower().encode("utf-8")).hexdigest()[:12],
-                "company": company_name,
-                "rep_name": rep_name,
-                "rep_email": rep_email,
-                "ordering_url": "",
-                "payment_terms": "",
-                "active": True,
-                "source_file": "",
-                "order_note": "",
-                "order_rows": [],
-            }
-        )
-    save_ordering_companies(pg, updated)
 
 
 def save_ordering_company_draft(
@@ -3240,183 +3168,103 @@ def parse_price_sheet_upload(file_name: str, file_bytes: bytes) -> tuple[list[di
     return [], "Unsupported file type. Use .csv, .xlsx, or .pdf."
 
 
+PRICE_LIST_DIR = Path(__file__).resolve().parent / "price_lists"
+PRICE_LIST_TYPES = ["pdf", "xlsx", "xls", "csv", "png", "jpg", "jpeg"]
+
+
+def _price_list_path(company_id: str, file_name: str) -> Path:
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(company_id or ""))
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", Path(str(file_name or "")).name)
+    return PRICE_LIST_DIR / safe_id / safe_name
+
+
+def save_company_price_list(pg: SyncPostgrestClient, company_id: str, file_name: str, data: bytes):
+    path = _price_list_path(company_id, file_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    companies = load_ordering_companies(pg)
+    for company in companies:
+        if str(company.get("id") or "") == str(company_id):
+            company["price_list_file"] = path.name
+    save_ordering_companies(pg, companies)
+
+
+def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_name: str):
+    try:
+        _price_list_path(company_id, file_name).unlink(missing_ok=True)
+    except OSError:
+        pass
+    companies = load_ordering_companies(pg)
+    for company in companies:
+        if str(company.get("id") or "") == str(company_id):
+            company["price_list_file"] = ""
+    save_ordering_companies(pg, companies)
+
+
+def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company_name: str, file_name: str):
+    with st.expander(f"{company_name} Price List", expanded=bool(file_name)):
+        path = _price_list_path(company_id, file_name) if file_name else None
+        if path and path.exists():
+            data = path.read_bytes()
+            suffix = path.suffix.lower()
+            st.caption(f"Current file: {path.name}")
+            try:
+                if suffix == ".pdf":
+                    import fitz
+
+                    with fitz.open(stream=data, filetype="pdf") as doc:
+                        page_count = len(doc)
+                        for page_index in range(page_count):
+                            pix = doc[page_index].get_pixmap(dpi=110)
+                            st.image(pix.tobytes("png"), caption=f"Page {page_index + 1} of {page_count}")
+                elif suffix in {".png", ".jpg", ".jpeg"}:
+                    st.image(data)
+                elif suffix == ".csv":
+                    st.dataframe(pd.read_csv(io.BytesIO(data)), width="stretch")
+                elif suffix in {".xlsx", ".xls"}:
+                    st.dataframe(pd.read_excel(io.BytesIO(data)), width="stretch")
+            except Exception:
+                st.info("Preview unavailable for this file. Use Download to open it.")
+            col_dl, col_rm = st.columns(2)
+            col_dl.download_button(
+                "Download price list",
+                data=data,
+                file_name=path.name,
+                key=f"price_list_download_{company_id}",
+            )
+            if col_rm.button("Remove price list", key=f"price_list_remove_{company_id}"):
+                remove_company_price_list(pg, company_id, path.name)
+                st.rerun()
+        else:
+            st.caption("No price list uploaded for this company yet.")
+        upload = st.file_uploader(
+            "Upload or replace price list",
+            type=PRICE_LIST_TYPES,
+            key=f"price_list_upload_{company_id}",
+        )
+        if upload is not None and st.button("Save price list", key=f"price_list_save_{company_id}", type="primary"):
+            if file_name and path and path.exists() and path.name != Path(upload.name).name:
+                remove_company_price_list(pg, company_id, path.name)
+            save_company_price_list(pg, company_id, upload.name, upload.getvalue())
+            st.success("Price list saved.")
+            st.rerun()
+
+
 def page_ordering(pg: SyncPostgrestClient):
     st.header("Ordering")
-    st.caption("Select a company to email its sales rep and check messages from listed reps.")
+    st.caption("Select a company to view its ordering details and email its sales rep.")
 
-    reps = load_ordering_sales_reps(pg)
     companies = load_ordering_companies(pg)
 
-    with st.expander("Sales Rep Directory", expanded=False):
-        st.caption("Edit a rep's company, brands, and contact details here. A new company entered here is added to the Company Directory automatically.")
-        company_names = sorted(
-            {str(company.get("company") or "").strip() for company in companies if str(company.get("company") or "").strip()},
-            key=str.casefold,
-        )
-        no_company_option = "— No company —"
-        add_company_option = "Add a new company..."
-        with st.form("ordering_add_rep_form", clear_on_submit=True):
-            add_rep_name = st.text_input("New rep name")
-            add_rep_email = st.text_input("New rep email")
-            add_rep_phone = st.text_input("New rep phone")
-            add_rep_brands = st.text_input("Brands", help="Enter multiple brands separated by commas.")
-            add_rep_company_choice = st.selectbox(
-                "Company",
-                [no_company_option, *company_names, add_company_option],
-            )
-            add_rep_new_company = st.text_input(
-                "New company name (when adding a new company)",
-            )
-            add_rep_active = st.checkbox("Active", value=True)
-            add_rep_submitted = st.form_submit_button("Add Sales Rep")
-
-        editor_rows = [
-            {
-                "Name": str(rep.get("name") or ""),
-                "Email": str(rep.get("email") or ""),
-                "Phone": str(rep.get("phone") or ""),
-                "Company": str(rep.get("company") or ""),
-                "Brands": str(rep.get("brands") or ""),
-                "Active": bool(rep.get("active", True)),
-            }
-            for rep in reps
-        ]
-        edited_rep_rows = st.data_editor(
-            editor_rows,
-            num_rows="fixed",
-            width="stretch",
-            key=f"ordering_reps_editor_{len(reps)}",
-        )
-
-        existing_reps_by_email = {
-            str(rep.get("email") or "").strip().lower(): rep
-            for rep in reps
-            if str(rep.get("email") or "").strip()
-        }
-        existing_reps_by_name = {
-            str(rep.get("name") or "").strip().lower(): rep
-            for rep in reps
-        }
-        updated_reps = []
-        for row in edited_rep_rows or []:
-            name = str((row or {}).get("Name") or "").strip()
-            email = parseaddr(str((row or {}).get("Email") or "").strip())[1].strip()
-            if not name:
-                continue
-            existing = existing_reps_by_email.get(email.lower()) or existing_reps_by_name.get(name.lower(), {})
-            updated_reps.append(
-                {
-                    "id": str(existing.get("id") or hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12]),
-                    "name": name,
-                    "email": email,
-                    "phone": str((row or {}).get("Phone") or "").strip(),
-                    "company": str((row or {}).get("Company") or "").strip(),
-                    "brands": str((row or {}).get("Brands") or "").strip(),
-                    "active": bool((row or {}).get("Active", True)),
-                }
-            )
-
-        visible_rep_rows = [
-            {
-                "Name": rep["name"],
-                "Email": rep["email"],
-                "Phone": rep["phone"],
-                "Company": rep["company"],
-                "Brands": rep["brands"],
-                "Active": rep["active"],
-            }
-            for rep in updated_reps
-        ]
-        if visible_rep_rows != editor_rows:
-            save_ordering_sales_reps(pg, updated_reps)
-            reps = updated_reps
-            new_company_added = False
-            known_company_names = {
-                str(company.get("company") or "").strip().casefold()
-                for company in load_ordering_companies(pg)
-            }
-            for rep in updated_reps:
-                company_name = str(rep.get("company") or "").strip()
-                if company_name and company_name.casefold() not in known_company_names:
-                    upsert_ordering_company_rep(
-                        pg,
-                        company_name,
-                        str(rep.get("name") or "").strip(),
-                        str(rep.get("email") or "").strip(),
-                    )
-                    known_company_names.add(company_name.casefold())
-                    new_company_added = True
-            st.toast("Sales rep changes saved.")
-            if new_company_added:
-                st.rerun()
-
-        if add_rep_submitted:
-            normalized_email = parseaddr(str(add_rep_email or "").strip())[1].strip()
-            rep_company = (
-                str(add_rep_new_company or "").strip()
-                if add_rep_company_choice == add_company_option
-                else "" if add_rep_company_choice == no_company_option else add_rep_company_choice
-            )
-            if not str(add_rep_name or "").strip():
-                st.warning("Enter the rep's name.")
-            elif not normalized_email or "@" not in normalized_email or any(char.isspace() for char in normalized_email):
-                st.warning("Enter a valid rep email address.")
-            elif add_rep_company_choice == add_company_option and not rep_company:
-                st.warning("Enter the new company name.")
-            else:
-                existing_emails = {
-                    parseaddr(str((row or {}).get("Email") or "").strip())[1].strip().lower()
-                    for row in edited_rep_rows or []
-                }
-                if normalized_email.lower() in existing_emails:
-                    st.warning("That email address is already in the Sales Reps directory.")
-                else:
-                    updated = []
-                    for row in edited_rep_rows or []:
-                        name = str((row or {}).get("Name") or "").strip()
-                        email = parseaddr(str((row or {}).get("Email") or "").strip())[1].strip()
-                        if name:
-                            updated.append(
-                                {
-                                    "id": hashlib.sha1(name.lower().encode("utf-8")).hexdigest()[:12],
-                                    "name": name,
-                                    "email": email,
-                                    "phone": str((row or {}).get("Phone") or "").strip(),
-                                    "company": str((row or {}).get("Company") or "").strip(),
-                                    "brands": str((row or {}).get("Brands") or "").strip(),
-                                    "active": bool((row or {}).get("Active", True)),
-                                }
-                            )
-                    rep_name = str(add_rep_name).strip()
-                    updated.append(
-                        {
-                            "id": hashlib.sha1(rep_name.lower().encode("utf-8")).hexdigest()[:12],
-                            "name": rep_name,
-                            "email": normalized_email,
-                            "phone": str(add_rep_phone or "").strip(),
-                            "company": rep_company,
-                            "brands": str(add_rep_brands or "").strip(),
-                            "active": bool(add_rep_active),
-                        }
-                    )
-                    save_ordering_sales_reps(pg, updated)
-                    if rep_company:
-                        upsert_ordering_company_rep(pg, rep_company, rep_name, normalized_email)
-                    st.rerun()
-
     with st.expander("Company Directory", expanded=True):
-        st.caption("Manage company ordering details, primary rep contact, and ordering website here. Company assignments can also be edited in the Sales Rep Directory.")
-        auto_sync_company_reps = st.checkbox(
-            "Auto-sync company reps into Sales Reps when saving",
-            value=bool(st.session_state.get("ordering_auto_sync_company_reps", True)),
-            key="ordering_auto_sync_company_reps",
-            help="When enabled, company rep name/email edits are also saved in the Sales Reps directory.",
-        )
+        st.caption("Manage each company's ordering details and single sales rep contact here.")
         company_editor_rows = [
             {
                 "Company": str(company.get("company") or ""),
-                "Sales Rep": str(company.get("rep_name") or ""),
+                "Sales Rep Name": str(company.get("rep_name") or ""),
                 "Rep Email": str(company.get("rep_email") or ""),
+                "Rep Phone": str(company.get("rep_phone") or ""),
+                "Brands": str(company.get("rep_brands") or ""),
                 "Ordering Website": str(company.get("ordering_url") or ""),
                 "Payment Terms": str(company.get("payment_terms") or ""),
                 "Active": bool(company.get("active", True)),
@@ -3427,11 +3275,11 @@ def page_ordering(pg: SyncPostgrestClient):
             company_editor_rows,
             num_rows="dynamic",
             width="stretch",
-            key="ordering_company_editor",
+            key="ordering_company_editor_v2",
             column_config={
                 "Payment Terms": st.column_config.SelectboxColumn(
                     "Payment Terms",
-                    options=["", "Net 30 days", "Credit Card"],
+                    options=["", "Net 30 days", "Credit Card", "Cash", "Check"],
                     help="Choose the payment terms for this company.",
                 )
             },
@@ -3449,11 +3297,16 @@ def page_ordering(pg: SyncPostgrestClient):
                 {
                     "id": company_id,
                     "company": company_name,
-                    "rep_name": str((row or {}).get("Sales Rep") or "").strip(),
+                    "rep_name": str((row or {}).get("Sales Rep Name") or "").strip(),
                     "rep_email": parseaddr(str((row or {}).get("Rep Email") or "").strip())[1].strip(),
+                    "rep_phone": str((row or {}).get("Rep Phone") or "").strip(),
+                    "rep_brands": str((row or {}).get("Brands") or "").strip(),
                     "ordering_url": str((row or {}).get("Ordering Website") or "").strip(),
                     "payment_terms": str((row or {}).get("Payment Terms") or "").strip(),
-                    "active": bool((row or {}).get("Active", True)),
+                    "price_list_file": str(existing.get("price_list_file") or ""),
+                    "active": (row or {}).get("Active") is not False and not (
+                        (row or {}).get("Active") is None and key_name in existing_map and not existing.get("active", True)
+                    ),
                     "source_file": str(existing.get("source_file") or ""),
                     "order_note": str(existing.get("order_note") or ""),
                     "order_rows": list(existing.get("order_rows") or []),
@@ -3463,8 +3316,10 @@ def page_ordering(pg: SyncPostgrestClient):
         visible_company_rows = [
             {
                 "Company": company["company"],
-                "Sales Rep": company["rep_name"],
+                "Sales Rep Name": company["rep_name"],
                 "Rep Email": company["rep_email"],
+                "Rep Phone": company["rep_phone"],
+                "Brands": company["rep_brands"],
                 "Ordering Website": company["ordering_url"],
                 "Payment Terms": company["payment_terms"],
                 "Active": company["active"],
@@ -3473,11 +3328,6 @@ def page_ordering(pg: SyncPostgrestClient):
         ]
         if visible_company_rows != company_editor_rows:
             save_ordering_companies(pg, updated_companies)
-            if auto_sync_company_reps:
-                current_reps = load_ordering_sales_reps(pg)
-                merged_reps = upsert_company_reps_into_sales_reps(updated_companies, current_reps)
-                save_ordering_sales_reps(pg, merged_reps)
-                reps = merged_reps
             st.toast("Company directory changes saved.")
 
     active_companies = [company for company in load_ordering_companies(pg) if company.get("active")]
@@ -3498,117 +3348,24 @@ def page_ordering(pg: SyncPostgrestClient):
         st.info("Add an active company in the Companies directory to start an email.")
     else:
         st.subheader(f"Email {selected_company.get('company', 'Sales Rep')}")
-        rep_name_key = f"ordering_rep_name_{selected_company_id}"
-        rep_email_key = f"ordering_rep_email_{selected_company_id}"
-        rep_name = st.text_input(
-            "Sales rep name",
-            value=str(selected_company.get("rep_name") or ""),
-            key=rep_name_key,
-        )
-        rep_email = st.text_input(
-            "Sales rep email",
-            value=str(selected_company.get("rep_email") or ""),
-            key=rep_email_key,
-        )
-        gmail_address = parseaddr(str(rep_email or "").strip())[1].strip()
+        rep_name = str(selected_company.get("rep_name") or "").strip()
+        rep_email = parseaddr(str(selected_company.get("rep_email") or "").strip())[1].strip()
+        rep_phone = str(selected_company.get("rep_phone") or "").strip()
+        rep_brands = str(selected_company.get("rep_brands") or "").strip()
+        st.write(f"Sales rep: {rep_name or 'Not set'}")
+        if rep_phone:
+            st.caption(f"Phone: {rep_phone}")
+        if rep_brands:
+            st.info(f"Brands: {rep_brands}")
+        else:
+            st.caption("No brands listed for this sales rep.")
+
+        gmail_address = rep_email
         if gmail_address and "@" in gmail_address:
             gmail_url = "https://mail.google.com/mail/?" + urlencode(
                 {"view": "cm", "fs": "1", "to": gmail_address}
             )
             st.link_button(gmail_address, gmail_url)
-        normalized_rep_email = parseaddr(str(rep_email or "").strip())[1].strip().lower()
-        selected_rep = next(
-            (
-                rep for rep in reps
-                if normalized_rep_email
-                and parseaddr(str(rep.get("email") or "").strip())[1].strip().lower() == normalized_rep_email
-            ),
-            None,
-        )
-        if selected_rep is None:
-            normalized_rep_name = str(rep_name or "").strip().casefold()
-            selected_rep = next(
-                (
-                    rep for rep in reps
-                    if normalized_rep_name
-                    and str(rep.get("name") or "").strip().casefold() == normalized_rep_name
-                    and str(rep.get("company") or "").strip().casefold()
-                    == str(selected_company.get("company") or "").strip().casefold()
-                ),
-                None,
-            )
-        rep_phone = st.text_input(
-            "Sales rep phone",
-            value=str((selected_rep or {}).get("phone") or ""),
-            key=f"ordering_rep_phone_{selected_company_id}",
-        )
-        if st.button("Save Rep Details", key=f"ordering_save_rep_{selected_company_id}"):
-            normalized_email = parseaddr(str(rep_email or "").strip())[1].strip()
-            if not str(rep_name or "").strip():
-                st.warning("Enter the sales rep's name.")
-            elif not normalized_email or "@" not in normalized_email or any(char.isspace() for char in normalized_email):
-                st.warning("Enter a valid sales rep email address.")
-            else:
-                original_email = parseaddr(str(selected_company.get("rep_email") or "").strip())[1].strip().lower()
-                original_name = str(selected_company.get("rep_name") or "").strip().casefold()
-                company_name = str(selected_company.get("company") or "").strip()
-                rep_index = next(
-                    (
-                        index for index, rep in enumerate(reps)
-                        if original_email
-                        and parseaddr(str(rep.get("email") or "").strip())[1].strip().lower() == original_email
-                    ),
-                    -1,
-                )
-                if rep_index < 0 and original_name:
-                    rep_index = next(
-                        (
-                            index for index, rep in enumerate(reps)
-                            if str(rep.get("name") or "").strip().casefold() == original_name
-                            and str(rep.get("company") or "").strip().casefold() == company_name.casefold()
-                        ),
-                        -1,
-                    )
-                duplicate_email = any(
-                    index != rep_index
-                    and parseaddr(str(rep.get("email") or "").strip())[1].strip().lower() == normalized_email.lower()
-                    for index, rep in enumerate(reps)
-                )
-                if duplicate_email:
-                    st.warning("That email address is already assigned to another sales rep.")
-                else:
-                    updated_reps = [dict(rep) for rep in reps]
-                    if rep_index >= 0:
-                        updated_reps[rep_index].update(
-                            {
-                                "name": str(rep_name).strip(),
-                                "email": normalized_email,
-                                "phone": str(rep_phone or "").strip(),
-                                "company": company_name,
-                            }
-                        )
-                    else:
-                        updated_reps.append(
-                            {
-                                "id": hashlib.sha1(str(rep_name).strip().lower().encode("utf-8")).hexdigest()[:12],
-                                "name": str(rep_name).strip(),
-                                "email": normalized_email,
-                                "phone": str(rep_phone or "").strip(),
-                                "company": company_name,
-                                "brands": "",
-                                "active": True,
-                            }
-                        )
-                    save_ordering_sales_reps(pg, updated_reps)
-                    upsert_ordering_company_rep(pg, company_name, str(rep_name).strip(), normalized_email)
-                    st.toast("Sales rep details saved.")
-                    st.rerun()
-
-        rep_brands = str((selected_rep or {}).get("brands") or "").strip()
-        if rep_brands:
-            st.info(f"Brands for {rep_name or selected_company.get('company', 'this rep')}: {rep_brands}")
-        else:
-            st.caption("No brands listed for this sales rep.")
 
         ordering_url = str(selected_company.get("ordering_url") or "").strip()
         if ordering_url and "://" not in ordering_url:
@@ -3619,6 +3376,13 @@ def page_ordering(pg: SyncPostgrestClient):
         payment_terms = str(selected_company.get("payment_terms") or "").strip()
         if payment_terms:
             st.caption(f"Payment terms: {payment_terms}")
+
+        _render_company_price_list(
+            pg,
+            selected_company_id,
+            str(selected_company.get("company") or ""),
+            str(selected_company.get("price_list_file") or ""),
+        )
 
         email_subject = st.text_input(
             "Subject",
@@ -3633,12 +3397,15 @@ def page_ordering(pg: SyncPostgrestClient):
 
         member_smtp = load_smtp_settings(pg)
         ordering_smtp = load_ordering_smtp_settings(pg)
-        sender_choice = st.radio(
-            "Send using",
-            ["Member SMTP (current default)", "Sales Rep SMTP profile"],
-            key="ordering_sender_choice",
-            horizontal=True,
-        )
+        rep_smtp_configured = all(ordering_smtp.get(k) for k in ("host", "from_addr", "password"))
+        sender_choice = "Member SMTP (current default)"
+        if rep_smtp_configured:
+            sender_choice = st.radio(
+                "Send using",
+                ["Member SMTP (current default)", "Sales Rep SMTP profile"],
+                key="ordering_sender_choice",
+                horizontal=True,
+            )
         smtp = ordering_smtp if sender_choice == "Sales Rep SMTP profile" else member_smtp
         smtp_ready = bool(smtp.get("host")) and bool(smtp.get("port")) and bool(smtp.get("from_addr")) and bool(smtp.get("password"))
         if not smtp_ready:
@@ -3669,64 +3436,100 @@ def page_ordering(pg: SyncPostgrestClient):
                 except Exception as exc:
                     st.error(f"Failed to send email: {exc}")
 
-    with st.expander("Inbox from Sales Reps", expanded=False):
-        st.caption("Inbox search and display are limited to active email addresses in the Sales Reps directory.")
-        inbox_settings = load_ordering_imap_settings(pg)
-        with st.form("ordering_imap_settings_form"):
-            imap_col1, imap_col2 = st.columns(2)
-            imap_host = imap_col1.text_input("IMAP server", value=inbox_settings["host"])
-            imap_port = imap_col2.number_input("IMAP port", min_value=1, max_value=65535, value=inbox_settings["port"])
-            imap_username = st.text_input("Inbox email address", value=inbox_settings["username"])
-            imap_password = st.text_input("Inbox password or app password", value=inbox_settings["password"], type="password")
-            imap_security = st.selectbox(
-                "Connection security",
-                ["SSL", "STARTTLS"],
-                index=0 if inbox_settings["security"] == "SSL" else 1,
-            )
-            save_imap_settings = st.form_submit_button("Save Inbox Settings")
 
-        if save_imap_settings:
-            save_setting(pg, "ordering_imap_host", imap_host.strip())
-            save_setting(pg, "ordering_imap_port", str(int(imap_port)))
-            save_setting(pg, "ordering_imap_security", imap_security)
-            save_setting(pg, "ordering_imap_username", imap_username.strip())
-            save_setting(pg, "ordering_imap_password", imap_password)
-            st.success("Inbox settings saved.")
+def page_inbox(pg: SyncPostgrestClient):
+    st.header("Inbox")
+    st.caption("Emails from your active sales reps. Reply right here.")
 
-        active_reps = [rep for rep in load_ordering_sales_reps(pg) if rep.get("active")]
-        allowed_addresses = sorted(
-            {
-                parseaddr(str(rep.get("email") or "").strip())[1].strip().lower()
-                for rep in active_reps
-                if parseaddr(str(rep.get("email") or "").strip())[1].strip()
-            }
+    top_left, top_right = st.columns([1, 1])
+    if top_left.button("Refresh", key="inbox_refresh"):
+        st.session_state["inbox_nonce"] = int(st.session_state.get("inbox_nonce", 0)) + 1
+        st.rerun()
+
+    messages, error = get_rep_inbox(pg)
+    if error == "not_configured":
+        st.info("Set up the inbox connection in Settings → Inbox Email Config (IMAP) first.")
+        return
+    if error == "no_reps":
+        st.info("Add an email address to an active company on the Ordering page first.")
+        return
+    if error == "loading":
+        st.info("Still checking your inbox. Click Refresh in a moment.")
+        return
+    if error:
+        st.error(f"Could not check the inbox: {error}")
+        return
+
+    read_ids = load_inbox_read_ids(pg)
+    unread = [m for m in messages if m["uid"] not in read_ids]
+    company_by_email = {
+        parseaddr(str(c.get("rep_email") or ""))[1].strip().lower(): str(c.get("company") or "")
+        for c in load_ordering_companies(pg)
+    }
+    top_right.metric("Unread", len(unread))
+    if unread and st.button("Mark all as read", key="inbox_mark_all"):
+        save_inbox_read_ids(pg, read_ids | {m["uid"] for m in messages})
+        st.rerun()
+
+    if not messages:
+        st.info("No messages from your sales reps yet.")
+        return
+
+    rep_smtp = load_ordering_smtp_settings(pg)
+    reply_smtp_choice = "Member SMTP (current default)"
+    if all(rep_smtp.get(k) for k in ("host", "from_addr", "password")):
+        reply_smtp_choice = st.radio(
+            "Reply using",
+            ["Member SMTP (current default)", "Sales Rep SMTP profile"],
+            key="inbox_reply_sender",
+            horizontal=True,
         )
-        if st.button("Check Rep Emails", key="ordering_check_rep_emails", disabled=not bool(allowed_addresses)):
-            saved_inbox_settings = load_ordering_imap_settings(pg)
-            try:
-                st.session_state["ordering_rep_inbox_messages"] = fetch_ordering_rep_emails(
-                    saved_inbox_settings,
-                    allowed_addresses,
-                )
-            except Exception as exc:
-                st.error(f"Could not check the rep inbox: {exc}")
+    smtp = rep_smtp if reply_smtp_choice == "Sales Rep SMTP profile" else load_smtp_settings(pg)
+    smtp_ready = all(smtp.get(k) for k in ("host", "port", "from_addr", "password"))
 
-        visible_addresses = set(allowed_addresses)
-        messages = [
-            message
-            for message in st.session_state.get("ordering_rep_inbox_messages", [])
-            if str(message.get("from_email") or "").lower() in visible_addresses
-        ]
-        if not allowed_addresses:
-            st.info("Add active reps with email addresses to the Sales Reps directory first.")
-        elif messages:
-            for index, message in enumerate(messages):
-                subject = str(message.get("subject") or "(no subject)")
-                with st.expander(subject, expanded=index == 0):
-                    st.caption(f"From: {message.get('from_name') or message['from_email']} <{message['from_email']}> · {message.get('date') or 'Date unavailable'}")
-                    st.text(str(message.get("body") or "(No plain-text message body.)"))
-        else:
-            st.info("No matching messages loaded. Select Check Rep Emails to refresh the inbox.")
+    for index, message in enumerate(messages):
+        uid = message["uid"]
+        is_unread = uid in {m["uid"] for m in unread}
+        key_suffix = hashlib.sha1(uid.encode("utf-8")).hexdigest()[:10]
+        company = company_by_email.get(message["from_email"], "")
+        subject = str(message.get("subject") or "(no subject)")
+        label = f"{'🔵 ' if is_unread else ''}{company + ' — ' if company else ''}{subject}"
+        with st.expander(label, expanded=is_unread and index == 0):
+            st.caption(
+                f"From: {message.get('from_name') or message['from_email']} <{message['from_email']}> · "
+                f"{message.get('date') or 'Date unavailable'}"
+            )
+            st.text(str(message.get("body") or "(No plain-text message body.)"))
+            if is_unread and st.button("Mark as read", key=f"inbox_read_{key_suffix}"):
+                save_inbox_read_ids(pg, read_ids | {uid})
+                st.rerun()
+
+            reply_text = st.text_area("Reply", key=f"inbox_reply_text_{key_suffix}", height=140)
+            if st.button("Send reply", key=f"inbox_reply_send_{key_suffix}", type="primary"):
+                reply_to = message.get("reply_to") or message["from_email"]
+                if not smtp_ready:
+                    st.warning("Configure the selected SMTP profile in Settings before sending.")
+                elif not reply_text.strip():
+                    st.warning("Write a reply first.")
+                else:
+                    try:
+                        send_email(
+                            smtp["host"],
+                            int(smtp["port"]),
+                            smtp.get("username", ""),
+                            smtp.get("password", ""),
+                            reply_to,
+                            subject if subject.lower().startswith("re:") else f"Re: {subject}",
+                            reply_text.strip(),
+                            security=smtp.get("security", "SSL"),
+                            from_addr=smtp.get("from_addr", ""),
+                            in_reply_to=message.get("message_id", ""),
+                            references=message.get("references", ""),
+                        )
+                        save_inbox_read_ids(pg, read_ids | {uid})
+                        st.success(f"Reply sent to {reply_to}.")
+                    except Exception as exc:
+                        st.error(f"Failed to send reply: {exc}")
 
 
 def load_drink_catalog(pg: SyncPostgrestClient) -> list[dict]:
@@ -5221,6 +5024,8 @@ def send_email(
     from_addr: str = "",
     attachments: list[dict] | None = None,
     inline_images: list[dict] | None = None,
+    in_reply_to: str = "",
+    references: str = "",
 ):
     normalized_to = parseaddr(str(to_addr or "").strip())[1].strip()
     if not normalized_to or "@" not in normalized_to:
@@ -5230,6 +5035,9 @@ def send_email(
     msg["Subject"] = subject
     msg["From"] = from_addr or smtp_user
     msg["To"] = normalized_to
+    if in_reply_to.strip():
+        msg["In-Reply-To"] = in_reply_to.strip()
+        msg["References"] = " ".join(part for part in (references.strip(), in_reply_to.strip()) if part)
     text_body = body + "\n\nBest,\nLiberty Smokes Management"
     msg.set_content(text_body)
 
@@ -5412,9 +5220,9 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
     port = int(settings.get("port") or 993)
     security = str(settings.get("security") or "SSL").upper()
     if security == "SSL":
-        mailbox = imaplib.IMAP4_SSL(host, port)
+        mailbox = imaplib.IMAP4_SSL(host, port, timeout=20)
     elif security == "STARTTLS":
-        mailbox = imaplib.IMAP4(host, port)
+        mailbox = imaplib.IMAP4(host, port, timeout=20)
         mailbox.starttls()
     else:
         raise ValueError("IMAP security must be SSL or STARTTLS.")
@@ -5425,39 +5233,32 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
         if status != "OK":
             raise RuntimeError("Could not open the inbox.")
 
-        message_ids: set[bytes] = set()
-        for address in allowed:
-            status, results = mailbox.search(None, "FROM", f'"{address}"')
-            if status == "OK" and results and results[0]:
-                message_ids.update(results[0].split())
+        criteria = [f'FROM "{address}"' for address in sorted(allowed)]
+        query = criteria[-1]
+        for criterion in reversed(criteria[:-1]):
+            query = f"OR {criterion} {query}"
+        status, results = mailbox.search(None, query)
+        message_ids = results[0].split() if status == "OK" and results and results[0] else []
 
         ordered_ids = sorted(message_ids, key=lambda value: int(value), reverse=True)[:max(1, int(limit))]
+        fetched: dict[bytes, bytes] = {}
+        if ordered_ids:
+            status, parts = mailbox.fetch(b",".join(ordered_ids).decode(),             "(BODY.PEEK[]<0.60000>)")
+            if status == "OK":
+                for part in parts:
+                    if isinstance(part, tuple) and isinstance(part[1], bytes):
+                        fetched[part[0].split()[0]] = part[1]
+
         messages = []
         for message_id in ordered_ids:
-            status, header_parts = mailbox.fetch(
-                message_id,
-                "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])",
-            )
-            if status != "OK":
+            raw_message = fetched.get(message_id, b"")
+            if not raw_message:
                 continue
-            raw_header = next(
-                (part[1] for part in header_parts if isinstance(part, tuple) and isinstance(part[1], bytes)),
-                b"",
-            )
-            header = BytesParser(policy=policy.default).parsebytes(raw_header)
-            from_name, from_email = parseaddr(str(header.get("From") or ""))
+            parsed_message = BytesParser(policy=policy.default).parsebytes(raw_message)
+            from_name, from_email = parseaddr(str(parsed_message.get("From") or ""))
             from_email = from_email.strip().lower()
             if from_email not in allowed:
                 continue
-
-            status, full_parts = mailbox.fetch(message_id, "(BODY.PEEK[])")
-            if status != "OK":
-                continue
-            raw_message = next(
-                (part[1] for part in full_parts if isinstance(part, tuple) and isinstance(part[1], bytes)),
-                b"",
-            )
-            parsed_message = BytesParser(policy=policy.default).parsebytes(raw_message)
             body_parts = []
             for part in parsed_message.walk():
                 if part.get_content_type() != "text/plain" or part.get_content_disposition() == "attachment":
@@ -5470,8 +5271,13 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
                 if isinstance(content, str) and content.strip():
                     body_parts.append(content.strip())
 
+            header_message_id = str(parsed_message.get("Message-ID") or "").strip()
             messages.append(
                 {
+                    "uid": header_message_id or f"imap-{message_id.decode()}",
+                    "message_id": header_message_id,
+                    "references": str(parsed_message.get("References") or "").strip(),
+                    "reply_to": parseaddr(str(parsed_message.get("Reply-To") or ""))[1].strip().lower(),
                     "from_name": from_name,
                     "from_email": from_email,
                     "subject": str(parsed_message.get("Subject") or ""),
@@ -5487,96 +5293,78 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
             pass
 
 
-def _phone_to_e164(phone: str, default_country_code: str = "+1") -> str:
-    raw = str(phone or "").strip()
-    if not raw:
-        return ""
-
-    digits = _normalize_phone(raw)
-    if not digits:
-        return ""
-
-    country = str(default_country_code or "+1").strip()
-    if not country.startswith("+"):
-        country = "+" + _normalize_phone(country)
-    if country == "+":
-        country = "+1"
-
-    if raw.startswith("+") and 8 <= len(digits) <= 15:
-        return "+" + digits
-    if len(digits) == 10:
-        return country + digits
-    if len(digits) == 11 and digits.startswith("1"):
-        return "+" + digits
-    if 8 <= len(digits) <= 15:
-        return "+" + digits
-    return ""
+INBOX_READ_IDS_KEY = "ordering_inbox_read_ids"
 
 
-def load_sms_settings(pg: SyncPostgrestClient) -> dict:
-    return {
-        "provider": (get_setting(pg, "sms_provider") or "twilio").strip().lower(),
-        "account_sid": (get_setting(pg, "twilio_account_sid") or "").strip(),
-        "auth_token": decrypt_secret(get_setting(pg, "twilio_auth_token")),
-        "from_number": (get_setting(pg, "twilio_from_number") or "").strip(),
-        "default_country_code": (get_setting(pg, "sms_default_country_code") or "+1").strip() or "+1",
-    }
+def _ordering_rep_addresses(pg: SyncPostgrestClient) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                parseaddr(str(company.get("rep_email") or "").strip())[1].strip().lower()
+                for company in load_ordering_companies(pg)
+                if company.get("active") and parseaddr(str(company.get("rep_email") or "").strip())[1].strip()
+            }
+        )
+    )
 
 
-def send_sms_twilio(account_sid: str, auth_token: str, from_number: str, to_number: str, body: str) -> str:
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
-    payload = {
-        "To": to_number,
-        "From": from_number,
-        "Body": body,
-    }
-    resp = requests.post(url, data=payload, auth=(account_sid, auth_token), timeout=30)
-    if resp.status_code >= 400:
-        detail = ""
-        try:
-            detail = str(resp.json().get("message") or "")
-        except Exception:
-            detail = (resp.text or "").strip()
-        if detail:
-            raise ValueError(detail)
-        raise ValueError(f"Twilio request failed ({resp.status_code}).")
+def load_inbox_read_ids(pg: SyncPostgrestClient) -> set[str]:
     try:
-        return str(resp.json().get("sid") or "")
-    except Exception:
-        return ""
+        data = json.loads(get_setting(pg, INBOX_READ_IDS_KEY) or "[]")
+    except (TypeError, ValueError):
+        return set()
+    return {str(item) for item in data} if isinstance(data, list) else set()
 
 
-def member_text_label(member: dict, to_number: str = "") -> str:
-    full_name = f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", ")
-    phone = str(member.get("phone") or "").strip()
-    normalized = to_number or phone
-    return f"{full_name} | {normalized}"
+def save_inbox_read_ids(pg: SyncPostgrestClient, read_ids: set[str]):
+    save_setting(pg, INBOX_READ_IDS_KEY, json.dumps(sorted(read_ids)[-1000:]))
 
 
-def send_mass_member_text(
-    sms_cfg: dict,
-    recipients: list[dict],
-    body_template: str,
-) -> tuple[int, list[tuple[str, str]]]:
-    sent_count = 0
-    failures: list[tuple[str, str]] = []
-    for member in recipients:
-        to_number = str(member.get("_sms_to") or "").strip()
-        if not to_number:
-            continue
-        try:
-            body = format_email_template(body_template, member)
-            send_sms_twilio(
-                sms_cfg["account_sid"],
-                sms_cfg["auth_token"],
-                sms_cfg["from_number"],
-                to_number,
-                body,
-            )
-            sent_count += 1
-        except Exception as exc:
-            failures.append((member_text_label(member, to_number=to_number), str(exc)))
-    return sent_count, failures
+_INBOX_CACHE: dict = {}
+_INBOX_CACHE_LOCK = threading.Lock()
+_INBOX_TTL_SECONDS = 180
+
+
+def _inbox_refresh(key: tuple, settings: dict, addresses: tuple):
+    try:
+        result = (fetch_ordering_rep_emails(settings, list(addresses)), "")
+    except Exception as exc:
+        result = ([], str(exc))
+    with _INBOX_CACHE_LOCK:
+        entry = _INBOX_CACHE.setdefault(key, {})
+        entry.update(result=result, ts=time.time(), thread=None)
+
+
+def _inbox_start_refresh(key: tuple, settings: dict, addresses: tuple) -> threading.Thread | None:
+    with _INBOX_CACHE_LOCK:
+        entry = _INBOX_CACHE.setdefault(key, {})
+        if entry.get("thread") is not None:
+            return entry["thread"]
+        thread = threading.Thread(target=_inbox_refresh, args=(key, settings, addresses), daemon=True)
+        entry["thread"] = thread
+    thread.start()
+    return thread
+
+
+def get_rep_inbox(pg: SyncPostgrestClient, wait: bool = True) -> tuple[list[dict], str]:
+    settings = load_ordering_imap_settings(pg)
+    addresses = _ordering_rep_addresses(pg)
+    if not (settings["host"] and settings["username"] and settings["password"]):
+        return [], "not_configured"
+    if not addresses:
+        return [], "no_reps"
+    key = (settings["username"], settings["host"], tuple(addresses), int(st.session_state.get("inbox_nonce", 0)))
+    entry = _INBOX_CACHE.get(key) or {}
+    fresh = entry.get("result") is not None and time.time() - entry.get("ts", 0) < _INBOX_TTL_SECONDS
+    if fresh:
+        return entry["result"]
+    thread = _inbox_start_refresh(key, settings, addresses)
+    if wait and thread is not None:
+        thread.join(timeout=60)
+        entry = _INBOX_CACHE.get(key) or {}
+    if entry.get("result") is not None:
+        return entry["result"]
+    return [], "loading"
 
 
 def member_email_label(member: dict) -> str:
@@ -5623,7 +5411,6 @@ def send_mass_member_email(
 def render_member_communications_section(
     pg: SyncPostgrestClient,
     members: list[dict],
-    show_member_mass_text_section: bool,
 ):
     st.subheader("Mass Email Members")
 
@@ -5829,117 +5616,6 @@ def render_member_communications_section(
                         )
                         st.rerun()
 
-    st.divider()
-    if show_member_mass_text_section:
-        st.subheader("Mass Text Members")
-
-        try:
-            sms_cfg = load_sms_settings(pg)
-        except Exception:
-            sms_cfg = {
-                "provider": "twilio",
-                "account_sid": "",
-                "auth_token": "",
-                "from_number": "",
-                "default_country_code": "+1",
-            }
-
-        members_with_phone = []
-        for member in members:
-            sms_to = _phone_to_e164(member.get("phone", ""), sms_cfg.get("default_country_code", "+1"))
-            if sms_to:
-                row = dict(member)
-                row["_sms_to"] = sms_to
-                members_with_phone.append(row)
-
-        if not members_with_phone:
-            st.info("No members with valid phone numbers are available yet.")
-        else:
-            st.caption(
-                "Placeholders available: {first_name}, {last_name}, {full_name}, {tier}, "
-                "{next_billing_date}, {join_date}, {status}, {locker}, {email}, {phone}"
-            )
-
-            text_recipient_mode = st.radio(
-                "Text recipients",
-                ["All members with valid phones", "Select members"],
-                horizontal=True,
-                key="mass_text_recipient_mode",
-            )
-
-            text_recipient_pool = members_with_phone
-            if text_recipient_mode == "Select members":
-                text_lookup = {str(m["id"]): m for m in members_with_phone}
-                selected_text_ids = st.multiselect(
-                    "Choose text recipients",
-                    options=list(text_lookup.keys()),
-                    format_func=lambda mid: member_text_label(text_lookup[mid], text_lookup[mid].get("_sms_to", "")),
-                    key="mass_text_selected_ids",
-                )
-                text_recipient_pool = [text_lookup[mid] for mid in selected_text_ids]
-
-            text_body = st.text_area(
-                "Text message",
-                key="mass_text_body",
-                height=140,
-                help="Use placeholders to personalize outgoing Twilio text messages.",
-            )
-            st.caption(f"Estimated recipients: {len(text_recipient_pool)}")
-
-            twilio_ready = bool(sms_cfg.get("account_sid") and sms_cfg.get("auth_token") and sms_cfg.get("from_number"))
-            if not twilio_ready:
-                st.info("Twilio SMS config is optional. Set it in Settings only if you want one-click sending from this app.")
-
-            if st.button("Send Mass Text", type="primary", disabled=not twilio_ready):
-                if not text_body.strip():
-                    st.warning("Message is required.")
-                elif not text_recipient_pool:
-                    st.warning("Select at least one recipient.")
-                else:
-                    sent_count, failures = send_mass_member_text(sms_cfg, text_recipient_pool, text_body)
-                    if sent_count:
-                        st.success(f"Sent {sent_count} text message(s).")
-                    if failures:
-                        failure_text = ", ".join(f"{label}: {error}" for label, error in failures[:3])
-                        if len(failures) > 3:
-                            failure_text += f" (+{len(failures) - 3} more)"
-                        st.error(f"Some texts failed: {failure_text}")
-                    if sent_count and not failures:
-                        queue_widget_reset(
-                            {
-                                "mass_text_body": "",
-                                "mass_text_selected_ids": [],
-                            },
-                            "pending_communications_widget_reset",
-                        )
-                        st.rerun()
-    else:
-        st.subheader("Mass Text Members")
-        st.caption("Hidden from communications page. Enable it in Settings -> Display.")
-
-
-def page_communications(pg: SyncPostgrestClient):
-    st.header("Campaigns")
-
-    pending_comms_reset = st.session_state.pop("pending_communications_widget_reset", None)
-    if isinstance(pending_comms_reset, dict):
-        reset_widget_state(pending_comms_reset)
-
-    try:
-        members = fetch_members(pg)
-    except Exception as exc:
-        st.error(f"Failed to load members: {exc}")
-        return
-
-    if not members:
-        st.info("No members yet. Add members first, then use this page for mass email and text.")
-        return
-
-    st.caption("Send mass email and text campaigns from one place.")
-    show_member_mass_text_section = _bool_setting(get_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY), True)
-    render_member_communications_section(pg, members, show_member_mass_text_section)
-
-
 def get_pending_reminders(members: list, templates: dict) -> list:
     today = datetime.date.today()
     pending = []
@@ -6060,28 +5736,10 @@ def maybe_run_automated_member_reminders(
 
 
 def _build_schedule_digest_rows(
-    monthly_reminders: list[dict],
     store_events: list[dict],
     lookahead_days: int = 31,
-) -> tuple[list[dict], list[dict]]:
+) -> list[dict]:
     today = datetime.date.today()
-    due_rows: list[dict] = []
-    for reminder in monthly_reminders or []:
-        if not bool(reminder.get("enabled")):
-            continue
-        due_date = _next_monthly_due_date(int(reminder.get("day_of_month") or 1), today)
-        days_left = (due_date - today).days
-        if 0 <= days_left <= lookahead_days:
-            due_rows.append(
-                {
-                    "title": str(reminder.get("title") or "").strip(),
-                    "due_date": due_date,
-                    "days_left": days_left,
-                    "notes": str(reminder.get("notes") or "").strip(),
-                }
-            )
-    due_rows.sort(key=lambda row: (row.get("due_date"), str(row.get("title") or "").lower()))
-
     event_rows: list[dict] = []
     for event in store_events or []:
         event_date_text = str(event.get("event_date") or "").strip()
@@ -6109,22 +5767,56 @@ def _build_schedule_digest_rows(
             str(row.get("title") or "").lower(),
         )
     )
-    return due_rows, event_rows
+    return event_rows
+
+
+def _split_email_text(text: str) -> list[str]:
+    return [
+        address
+        for part in re.split(r"[,;\s]+", str(text or ""))
+        if (address := parseaddr(part.strip())[1].strip()) and "@" in address
+    ]
+
+
+def resolve_digest_recipients(
+    pg: SyncPostgrestClient,
+    extra_text: str,
+    include_members: bool,
+    include_list: bool,
+) -> list[str]:
+    addresses = _split_email_text(extra_text)
+    if include_members:
+        for member in fetch_members(pg):
+            if str(member.get("status") or "").strip().lower() in {"active", "past due"}:
+                addresses.extend(_split_email_text(str(member.get("email") or "")))
+    if include_list:
+        for row in _load_json_list_setting(pg, PUBLIC_MAILING_LIST_KEY):
+            addresses.extend(_split_email_text(str(row.get("email") or "")))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for address in addresses:
+        if address.lower() not in seen:
+            seen.add(address.lower())
+            unique.append(address)
+    return unique
 
 
 def send_schedule_digest_email(
     smtp: dict,
-    recipient_email: str,
-    monthly_reminders: list[dict],
+    recipient_email: str | list[str],
     store_events: list[dict],
     lookahead_days: int = 31,
 ) -> dict:
-    recipient = parseaddr(str(recipient_email or "").strip())[1].strip()
-    if not recipient:
+    recipients = (
+        _split_email_text(recipient_email)
+        if isinstance(recipient_email, str)
+        else list(recipient_email or [])
+    )
+    if not recipients:
         raise ValueError("Schedule digest recipient email is required.")
+    recipient = recipients[0]
 
-    due_rows, event_rows = _build_schedule_digest_rows(
-        monthly_reminders,
+    event_rows = _build_schedule_digest_rows(
         store_events,
         lookahead_days=lookahead_days,
     )
@@ -6135,21 +5827,8 @@ def send_schedule_digest_email(
         f"Schedule digest generated on {today_txt}.",
         f"Window: next {lookahead_days} day(s).",
         "",
-        "Monthly reminders due soon:",
+        "Upcoming store events:",
     ]
-    if due_rows:
-        for row in due_rows:
-            line = (
-                f"- {row['title']} | due {row['due_date'].strftime('%Y-%m-%d')} "
-                f"({int(row['days_left'])} day(s))"
-            )
-            if row.get("notes"):
-                line += f" | notes: {row['notes']}"
-            body_lines.append(line)
-    else:
-        body_lines.append("- None")
-
-    body_lines.extend(["", "Upcoming store events:"])
     if event_rows:
         for row in event_rows:
             when_txt = row["event_date"].strftime("%Y-%m-%d")
@@ -6167,21 +5846,30 @@ def send_schedule_digest_email(
     else:
         body_lines.append("- None")
 
-    send_email(
-        smtp["host"],
-        int(smtp["port"]),
-        smtp.get("username", ""),
-        smtp.get("password", ""),
-        recipient,
-        subject,
-        "\n".join(body_lines),
-        security=smtp.get("security", "SSL"),
-        from_addr=smtp.get("from_addr", ""),
-    )
+    sent = 0
+    failed: list[str] = []
+    for address in recipients:
+        try:
+            send_email(
+                smtp["host"],
+                int(smtp["port"]),
+                smtp.get("username", ""),
+                smtp.get("password", ""),
+                address,
+                subject,
+                "\n".join(body_lines),
+                security=smtp.get("security", "SSL"),
+                from_addr=smtp.get("from_addr", ""),
+            )
+            sent += 1
+        except Exception:
+            if len(recipients) == 1:
+                raise
+            failed.append(address)
     return {
-        "sent": 1,
-        "recipient": recipient,
-        "due_count": len(due_rows),
+        "sent": sent,
+        "failed": failed,
+        "recipient": recipient if len(recipients) == 1 else f"{len(recipients)} recipients",
         "events_count": len(event_rows),
     }
 
@@ -6189,14 +5877,18 @@ def send_schedule_digest_email(
 def maybe_run_automated_schedule_digest(
     pg: SyncPostgrestClient,
     smtp: dict,
-    monthly_reminders: list[dict],
     store_events: list[dict],
 ) -> tuple[bool, str, dict]:
     enabled = _bool_setting(get_setting(pg, SCHEDULE_EMAIL_AUTO_ENABLED_KEY), False)
     if not enabled:
         return False, "disabled", {}
 
-    recipient = parseaddr(str(get_setting(pg, SCHEDULE_EMAIL_TO_KEY) or "").strip())[1].strip()
+    recipient = resolve_digest_recipients(
+        pg,
+        str(get_setting(pg, SCHEDULE_EMAIL_TO_KEY) or ""),
+        _bool_setting(get_setting(pg, SCHEDULE_EMAIL_MEMBERS_KEY), False),
+        _bool_setting(get_setting(pg, SCHEDULE_EMAIL_LIST_KEY), False),
+    )
     if not recipient:
         return False, "missing_recipient", {}
 
@@ -6215,14 +5907,13 @@ def maybe_run_automated_schedule_digest(
     stats = send_schedule_digest_email(
         smtp,
         recipient,
-        monthly_reminders,
         store_events,
         lookahead_days=31,
     )
     save_setting(pg, SCHEDULE_EMAIL_AUTO_LAST_RUN_KEY, now.isoformat(timespec="seconds"))
     result_summary = (
         f"sent={stats.get('sent', 0)}; recipient={stats.get('recipient', '')}; "
-        f"due={stats.get('due_count', 0)}; events={stats.get('events_count', 0)}"
+        f"events={stats.get('events_count', 0)}"
     )
     save_setting(pg, SCHEDULE_EMAIL_AUTO_LAST_RESULT_KEY, result_summary)
     return True, "ran", stats
@@ -6366,7 +6057,7 @@ def render_seat_card(
                         )
                     st.rerun()
             else:
-                st.caption("No drinks configured yet. Add drinks and costs in Settings -> Drink Catalog.")
+                st.caption("No drinks configured yet.")
                 c1, c2 = st.columns(2)
                 if c1.button("+ Alcoholic", key=f"plus_alc_{seat_number}", disabled=plus_disabled):
                     add_drink_type(
@@ -6752,92 +6443,122 @@ def render_member_purchase_margins(
 
 def page_members(pg: SyncPostgrestClient):
     st.header("Member Management")
+    members_tab, gift_cards_tab, communications_tab = st.tabs(
+        ["Members", "Gift Cards", "Communications"]
+    )
 
     pending_members_reset = st.session_state.pop("pending_members_widget_reset", None)
     if isinstance(pending_members_reset, dict):
         reset_widget_state(pending_members_reset)
 
-    with st.expander("Import Members (CSV)", expanded=False):
-        st.caption(
-            "Upload a CSV export from your old app. Supported columns include "
-            "first_name/last_name or name, plus email, phone, tier, status, locker, "
-            "join_date, and next_billing_date."
-        )
-        upload = st.file_uploader("Members CSV", type=["csv"], key="members_csv_upload")
-        if upload is not None and st.button("Import CSV"):
-            try:
-                csv_text = upload.getvalue().decode("utf-8")
-                inserted, skipped = import_members_csv(pg, csv_text)
-                st.success(f"Imported {inserted} member(s). Skipped {skipped} row(s).")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Import failed: {exc}")
-
-    with st.expander("Add New Member", expanded=False):
-        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-        fn = c1.text_input("First Name", key="m_fn")
-        ln = c2.text_input("Last Name", key="m_ln")
-        em = c3.text_input("Email", key="m_em")
-        phone = c4.text_input("Phone", key="m_phone")
-        tier = c5.selectbox("Tier", ["Monthly", "Annual"], key="m_tier")
-        locker = c6.text_input("Locker", key="m_locker")
-        months = c7.number_input("Pay Months", min_value=1, max_value=12, value=1, step=1, key="m_months")
-        if st.button("Add Member"):
-            if fn and ln:
+    with members_tab:
+        with st.expander("Import Members (CSV)", expanded=False):
+            st.caption(
+                "Upload a CSV export from your old app. Supported columns include "
+                "first_name/last_name or name, plus email, phone, tier, status, locker, "
+                "join_date, and next_billing_date."
+            )
+            upload = st.file_uploader("Members CSV", type=["csv"], key="members_csv_upload")
+            if upload is not None and st.button("Import CSV"):
                 try:
-                    added_member = add_member(pg, fn, ln, em, phone, tier, locker, int(months))
-                    if em.strip() and _bool_setting(get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False):
-                        try:
-                            templates = load_email_templates(pg)
-                            smtp = load_smtp_settings(pg)
-                            if (
-                                smtp.get("host")
-                                and smtp.get("port")
-                                and smtp.get("from_addr")
-                                and smtp.get("password")
-                            ):
-                                send_email(
-                                    smtp["host"],
-                                    int(smtp["port"]),
-                                    smtp.get("username", ""),
-                                    smtp["password"],
-                                    em.strip(),
-                                    format_email_template(templates["welcome_subject"], added_member),
-                                    format_email_template(templates["welcome_body"], added_member),
-                                    security=smtp.get("security", "SSL"),
-                                    from_addr=smtp.get("from_addr", ""),
-                                )
-                                st.info("Welcome email sent.")
-                            else:
-                                st.info("Member added. SMTP is not fully configured, so welcome email was skipped.")
-                        except Exception as exc:
-                            st.warning(f"Member added, but welcome email failed: {exc}")
-                    elif em.strip():
-                        st.info("Member added. Automatic welcome emails are disabled.")
-                    st.success(f"Added {fn} {ln}.")
-                    queue_widget_reset(
-                        {
-                            "m_fn": "",
-                            "m_ln": "",
-                            "m_em": "",
-                            "m_phone": "",
-                            "m_locker": "",
-                            "m_tier": "Monthly",
-                            "m_months": 1,
-                        },
-                        "pending_members_widget_reset",
-                    )
+                    csv_text = upload.getvalue().decode("utf-8")
+                    inserted, skipped = import_members_csv(pg, csv_text)
+                    st.success(f"Imported {inserted} member(s). Skipped {skipped} row(s).")
                     st.rerun()
                 except Exception as exc:
-                    st.error(f"Failed: {exc}")
-            else:
-                st.warning("First and last name are required.")
+                    st.error(f"Import failed: {exc}")
+
+        with st.expander("Add New Member", expanded=False):
+            c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+            fn = c1.text_input("First Name", key="m_fn")
+            ln = c2.text_input("Last Name", key="m_ln")
+            em = c3.text_input("Email", key="m_em")
+            phone = c4.text_input("Phone", key="m_phone")
+            tier = c5.selectbox("Tier", ["Monthly", "Annual"], key="m_tier")
+            locker = c6.text_input("Locker", key="m_locker")
+            months = c7.number_input("Pay Months", min_value=1, max_value=12, value=1, step=1, key="m_months")
+            if st.button("Add Member"):
+                if fn and ln:
+                    try:
+                        added_member = add_member(pg, fn, ln, em, phone, tier, locker, int(months))
+                        if em.strip() and _bool_setting(get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False):
+                            try:
+                                templates = load_email_templates(pg)
+                                smtp = load_smtp_settings(pg)
+                                if (
+                                    smtp.get("host")
+                                    and smtp.get("port")
+                                    and smtp.get("from_addr")
+                                    and smtp.get("password")
+                                ):
+                                    send_email(
+                                        smtp["host"],
+                                        int(smtp["port"]),
+                                        smtp.get("username", ""),
+                                        smtp["password"],
+                                        em.strip(),
+                                        format_email_template(templates["welcome_subject"], added_member),
+                                        format_email_template(templates["welcome_body"], added_member),
+                                        security=smtp.get("security", "SSL"),
+                                        from_addr=smtp.get("from_addr", ""),
+                                    )
+                                    st.info("Welcome email sent.")
+                                else:
+                                    st.info("Member added. SMTP is not fully configured, so welcome email was skipped.")
+                            except Exception as exc:
+                                st.warning(f"Member added, but welcome email failed: {exc}")
+                        elif em.strip():
+                            st.info("Member added. Automatic welcome emails are disabled.")
+                        st.success(f"Added {fn} {ln}.")
+                        queue_widget_reset(
+                            {
+                                "m_fn": "",
+                                "m_ln": "",
+                                "m_em": "",
+                                "m_phone": "",
+                                "m_locker": "",
+                                "m_tier": "Monthly",
+                                "m_months": 1,
+                            },
+                            "pending_members_widget_reset",
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Failed: {exc}")
+                else:
+                    st.warning("First and last name are required.")
 
     try:
         members = fetch_members(pg)
     except Exception as exc:
         st.error(f"Failed to load members: {exc}")
         return
+
+    with members_tab:
+        export_fields = [
+            "first_name",
+            "last_name",
+            "email",
+            "phone",
+            "tier",
+            "status",
+            "locker",
+            "join_date",
+            "next_billing_date",
+        ]
+        export_buf = io.StringIO()
+        export_writer = csv.DictWriter(export_buf, fieldnames=export_fields, extrasaction="ignore")
+        export_writer.writeheader()
+        for member in members:
+            export_writer.writerow({field: member.get(field) or "" for field in export_fields})
+        st.download_button(
+            "Export Members (CSV)",
+            data=export_buf.getvalue(),
+            file_name=f"members_{datetime.date.today().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            key="members_csv_export",
+            disabled=not members,
+        )
 
     try:
         loyalty_customers = load_pos_loyalty_customers(pg)
@@ -6861,25 +6582,26 @@ def page_members(pg: SyncPostgrestClient):
     except Exception:
         cigarpos_cfg = {"base_url": ""}
 
-    if not members:
-        st.info("No members yet. Use 'Add New Member' above to create your first member.")
-        if st.button("Create Sample Member"):
-            try:
-                add_member(
-                    pg,
-                    first_name="Sample",
-                    last_name="Member",
-                    email="",
-                    phone="",
-                    tier="Monthly",
-                    locker="—",
-                    months=1,
-                )
-                st.success("Sample member created.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Failed to create sample member: {exc}")
-        return
+    with members_tab:
+        if not members:
+            st.info("No members yet. Use 'Add New Member' above to create your first member.")
+            if st.button("Create Sample Member"):
+                try:
+                    add_member(
+                        pg,
+                        first_name="Sample",
+                        last_name="Member",
+                        email="",
+                        phone="",
+                        tier="Monthly",
+                        locker="—",
+                        months=1,
+                    )
+                    st.success("Sample member created.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to create sample member: {exc}")
+            return
 
     today = datetime.date.today()
     rows = []
@@ -6906,882 +6628,515 @@ def page_members(pg: SyncPostgrestClient):
             }
         )
 
-    st.dataframe(rows, width="stretch", hide_index=True)
+    with members_tab:
+        st.dataframe(rows, width="stretch", hide_index=True)
 
-    st.divider()
-    refill_title_col, refill_action_col = st.columns([3, 1])
-    with refill_title_col:
-        st.subheader("🎁 Gift Card Refills Due Today")
-    with refill_action_col:
-        if st.button(
-            "Backfill Missing Refill Dates",
-            key="gift_refill_backfill_btn",
-            help="Fix active monthly members missing a refill due date.",
-        ):
-            updated_count = backfill_missing_gift_card_refill_dates(pg)
-            if updated_count:
-                st.success(f"Backfilled {updated_count} member(s).")
-            else:
-                st.info("No missing refill dates found.")
+    with gift_cards_tab:
+        st.subheader("Gift Cards")
+        st.caption("One searchable list for card numbers and monthly refill actions.")
+        backfill_col, _ = st.columns([1, 3])
+        if backfill_col.button("Backfill Missing Refill Dates", key="gift_refill_backfill_btn"):
+            count = backfill_missing_gift_card_refill_dates(pg)
+            st.success(f"Backfilled {count} member(s)." if count else "No missing refill dates found.")
             st.rerun()
-    st.caption("Only cards due today and not overfilled appear here; future-due and overdue cards are excluded.")
-    
-    refill_due_members = fetch_gift_card_refill_due(pg)
-    refill_rows_all = fetch_member_monthly_refills(pg)
-    refill_months_by_member: dict[str, int] = {}
-    for refill_row in refill_rows_all:
-        refill_member_id = str(refill_row.get("member_id") or "").strip()
-        if refill_member_id:
-            refill_months_by_member[refill_member_id] = int(
-                refill_months_by_member.get(refill_member_id, 0)
-            ) + parse_refill_credit_months(str(refill_row.get("notes") or ""))
-    refill_members_by_id = {str(member.get("id")): member for member in members}
-    
-    # Only prompt for cards due today; overdue and overfilled cards are excluded.
-    today_refills = []
-    for m in refill_due_members:
-        refill_date = m.get("calculated_refill_date") or m.get("next_gift_card_refill_date")
-        try:
-            if refill_date:
-                refill_dt = datetime.datetime.strptime(refill_date, "%Y-%m-%d").date()
-                member_id = str(m.get("id") or "").strip()
-                member_record = refill_members_by_id.get(member_id, {})
-                active_months = member_active_months(member_record, today)
-                credited_months = refill_months_by_member.get(member_id, 0)
-                is_overfilled = credited_months > active_months
-                if refill_dt == today and not is_overfilled:
-                    today_refills.append(m)
-        except Exception:
-            pass
-    
-    # Sort by locker number
-    def get_locker_sort_key(member):
-        locker = str(member.get("locker", "")).strip()
-        if locker and locker != "—":
+
+        all_refills = fetch_member_monthly_refills(pg)
+        months = list(dict.fromkeys(str(row.get("month_start") or "").strip() for row in all_refills))
+        months = [month for month in months if month]
+        current_month = month_start_for()
+        if current_month not in months:
+            months.insert(0, current_month)
+        setting_col1, setting_col2, setting_col3 = st.columns([1, 1, 2])
+        with setting_col1:
+            refill_month = st.selectbox("Refill month", months, format_func=month_label, key="gift_refill_month")
+        with setting_col2:
+            refill_amount = st.number_input("Gift card amount", min_value=0.0, value=25.0, step=1.0, key="gift_refill_amount")
+        with setting_col3:
+            refill_note = st.text_input("Refill note (optional)", key="gift_refill_note")
+        credit_months = st.number_input("Months credited per refill", min_value=1, max_value=12, value=1, step=1, key="gift_refill_credit_months")
+
+        month_refills = fetch_member_monthly_refills(pg, month_start=refill_month)
+        refill_map = {str(row.get("member_id")): row for row in month_refills}
+        active_members = [m for m in members if str(m.get("status") or "").strip().lower() == "active"]
+        active_by_id = {str(m.get("id")): m for m in active_members}
+        credited_by_member = {}
+        for row in all_refills:
+            mid = str(row.get("member_id") or "").strip()
+            if mid:
+                credited_by_member[mid] = credited_by_member.get(mid, 0) + parse_refill_credit_months(str(row.get("notes") or ""))
+
+        due_today_ids = set()
+        today = datetime.date.today()
+        for due_member in fetch_gift_card_refill_due(pg):
+            mid = str(due_member.get("id") or "").strip()
+            due_date = due_member.get("calculated_refill_date") or due_member.get("next_gift_card_refill_date")
+            member = active_by_id.get(mid)
+            if not member or not due_date:
+                continue
             try:
-                return (0, int(locker))  # Numeric lockers come first, sorted numerically
+                is_due_today = datetime.datetime.strptime(str(due_date), "%Y-%m-%d").date() == today
             except ValueError:
-                return (1, locker)  # Non-numeric lockers come after, sorted alphabetically
-        return (2, "")  # "—" comes last
-    
-    today_refills.sort(key=get_locker_sort_key)
-    
-    if not today_refills:
-        st.success("✓ No refills due today!")
-    else:
-        st.write(f"**{len(today_refills)} member(s) due for refill today:**")
-        
-        # Select All / Deselect All buttons
-        select_col1, select_col2 = st.columns(2)
-        with select_col1:
-            if st.button("Select All", use_container_width=True):
-                for m in today_refills:
-                    st.session_state[f"gift_refill_checkbox_{m['id']}"] = True
+                is_due_today = False
+            if is_due_today and credited_by_member.get(mid, 0) <= member_active_months(member, today):
+                due_today_ids.add(mid)
+
+        pending_ids = [str(m.get("id")) for m in active_members if str(m.get("id")) not in refill_map]
+        refilled_ids = [mid for mid in active_by_id if mid in refill_map]
+        pending_count, refilled_count = st.columns(2)
+        pending_count.metric(f"Pending in {month_label(refill_month)}", len(active_by_id) - len(refilled_ids))
+        refilled_count.metric(f"Refilled in {month_label(refill_month)}", len(refilled_ids))
+        query = st.text_input("Find a member", placeholder="Name, locker, email, phone, or card number", key="gift_card_search").strip().casefold()
+
+        table_rows = []
+        for member in sorted(active_members, key=_locker_sort_key):
+            mid = str(member.get("id"))
+            name = f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", ")
+            locker = str(member.get("locker") or "").strip() or "—"
+            card_number = str(member.get("gift_card_number") or "")
+            search_text = " ".join((name, locker, str(member.get("email") or ""), str(member.get("phone") or ""), card_number)).casefold()
+            if query and query not in search_text:
+                continue
+            active_months = member_active_months(member, today)
+            credited_months = credited_by_member.get(mid, 0)
+            month_delta = active_months - credited_months
+            if month_delta == 0:
+                refill_progress = "Matched"
+            elif month_delta > 0:
+                refill_progress = f"Behind {month_delta}"
+            else:
+                refill_progress = f"Overfilled {abs(month_delta)}"
+            table_rows.append({
+                "ID": mid,
+                "Select": False,
+                "Member": name,
+                "Locker": locker,
+                "Gift Card #": card_number,
+                "Refill Status": "Refilled" if mid in refill_map else "Pending",
+                "Next Refill": "Due today" if mid in due_today_ids else str(member.get("next_gift_card_refill_date") or ""),
+                "Refill Progress": refill_progress,
+            })
+
+        edited_rows = st.data_editor(
+            table_rows,
+            key=f"gift_card_table_{st.session_state.get('gift_card_table_version', 0)}",
+            width="stretch",
+            hide_index=True,
+            disabled=["ID", "Member", "Locker", "Refill Status", "Next Refill", "Refill Progress"],
+            column_config={
+                "ID": None,
+                "Select": st.column_config.CheckboxColumn("Select", default=False),
+                "Gift Card #": st.column_config.TextColumn("Gift Card #"),
+            },
+        )
+        selected_ids = [str(row.get("ID")) for row in edited_rows or [] if row.get("Select")]
+
+        def show_action_result(label, successes, failures):
+            if successes:
+                st.success(f"{label} for {successes} member(s).")
+            if failures:
+                st.error("Some actions failed: " + "; ".join(failures[:5]))
+
+        def record_refills(member_ids):
+            if not member_ids:
+                st.warning("Select at least one member in the list.")
+                return
+            successes, failures = 0, []
+            for mid in member_ids:
+                if refill_month == current_month and mid in due_today_ids:
+                    ok, error = update_member_gift_card_refill_date(pg, mid, str(today), credit_months=int(credit_months))
+                    if not ok:
+                        failures.append(f"{mid}: {error}")
+                        continue
+                ok, error = mark_member_monthly_refill(
+                    pg, mid, month_start=refill_month, amount=float(refill_amount),
+                    notes=refill_note, credit_months=int(credit_months),
+                )
+                if ok:
+                    successes += 1
+                else:
+                    failures.append(f"{mid}: {error}")
+            if successes:
+                st.session_state["gift_card_table_version"] = int(st.session_state.get("gift_card_table_version", 0)) + 1
+            show_action_result(f"Marked as refilled for {month_label(refill_month)}", successes, failures)
+            if successes:
                 st.rerun()
-        with select_col2:
-            if st.button("Deselect All", use_container_width=True):
-                for m in today_refills:
-                    st.session_state[f"gift_refill_checkbox_{m['id']}"] = False
+
+        action_cols = st.columns(4)
+        if action_cols[0].button("Save Card Numbers", key="gift_card_save_numbers_btn", use_container_width=True):
+            successes, failures = 0, []
+            for row in edited_rows or []:
+                mid = str(row.get("ID") or "")
+                member = active_by_id.get(mid)
+                if not member:
+                    continue
+                number = str(row.get("Gift Card #") or "").strip()
+                if number == str(member.get("gift_card_number") or "").strip():
+                    continue
+                ok, error = update_member_gift_card_number(pg, mid, number)
+                if ok:
+                    successes += 1
+                else:
+                    failures.append(f"{mid}: {error}")
+            if successes:
+                st.session_state["gift_card_table_version"] = int(st.session_state.get("gift_card_table_version", 0)) + 1
+            show_action_result("Saved card numbers", successes, failures)
+            if successes:
                 st.rerun()
-        
-        st.divider()
-        
-        # Display members with checkboxes
-        for m in today_refills:
-            member_id = m["id"]
-            member_display = f"{m['last_name']}, {m['first_name']} | Locker {m.get('locker', '—')} | {m.get('tier', '')} | Card: {m.get('gift_card_number', '—')}"
-            
-            st.checkbox(
-                member_display,
-                key=f"gift_refill_checkbox_{member_id}"
+        if action_cols[1].button("Mark Selected Refilled", key="gift_refill_mark_btn", type="primary", disabled=not selected_ids, use_container_width=True):
+            record_refills(selected_ids)
+        if action_cols[2].button("Skip Selected Due Today", key="gift_refill_skip_btn", disabled=not any(mid in due_today_ids for mid in selected_ids), use_container_width=True, help="Advances the refill schedule without recording a monthly refill."):
+            skipped, failures = 0, []
+            for mid in selected_ids:
+                if mid not in due_today_ids:
+                    continue
+                ok, error = skip_member_gift_card_refill(pg, mid)
+                if ok:
+                    skipped += 1
+                else:
+                    failures.append(f"{mid}: {error}")
+            show_action_result("Skipped scheduled refill", skipped, failures)
+            if skipped:
+                st.rerun()
+        if action_cols[3].button("Undo Selected Refill", key="gift_refill_unmark_btn", disabled=not any(mid in refill_map for mid in selected_ids), use_container_width=True, help="Removes the monthly record but does not change the schedule."):
+            undone, failures = 0, []
+            for mid in selected_ids:
+                if mid not in refill_map:
+                    continue
+                ok, error = unmark_member_monthly_refill(pg, mid, month_start=refill_month)
+                if ok:
+                    undone += 1
+                else:
+                    failures.append(f"{mid}: {error}")
+            show_action_result("Undid refill status", undone, failures)
+            if undone:
+                st.rerun()
+        if pending_ids and st.button("Mark All Pending Refilled", key="gift_refill_mark_all_btn"):
+            record_refills(pending_ids)
+
+        matched_count = 0
+        behind_members = []
+        overfilled_count = 0
+        for mid, member in active_by_id.items():
+            delta = member_active_months(member, today) - credited_by_member.get(mid, 0)
+            if delta == 0:
+                matched_count += 1
+            elif delta > 0:
+                behind_members.append((mid, delta))
+            else:
+                overfilled_count += 1
+
+        progress_col1, progress_col2, progress_col3 = st.columns(3)
+        progress_col1.metric("On track", matched_count)
+        progress_col2.metric("Behind", len(behind_members))
+        progress_col3.metric("Overfilled", overfilled_count)
+        if behind_members:
+            behind_total = sum(delta for _, delta in behind_members)
+            st.warning(
+                f"{len(behind_members)} member(s) are behind by {behind_total} total month(s). "
+                "Use catch-up credits only if those refills were already given."
             )
-        
+            with st.expander("Advanced: Apply catch-up credits", expanded=False):
+                if st.button("Apply Catch-Up Credits (Tracking Only)", key="gift_refill_apply_catchup_btn"):
+                    adjusted, failures = 0, []
+                    for mid, delta in behind_members:
+                        ok, error = apply_refill_credit_adjustment(pg, mid, delta, month_start=refill_month)
+                        if ok:
+                            adjusted += 1
+                        else:
+                            failures.append(f"{mid}: {error}")
+                    if adjusted:
+                        st.success(f"Applied catch-up credits for {adjusted} member(s).")
+                    if failures:
+                        st.error("Some catch-up adjustments failed: " + "; ".join(failures[:3]))
+                    st.rerun()
+
+        with st.expander(f"Refill details for {month_label(refill_month)}", expanded=False):
+            details = [
+                {"Member": f"{active_by_id[mid].get('last_name', '')}, {active_by_id[mid].get('first_name', '')}",
+                 "Locker": str(active_by_id[mid].get("locker") or "").strip() or "—",
+                 "Amount": float(row.get("amount") or 0), "Refilled At": str(row.get("refilled_at") or ""),
+                 "Note": str(row.get("notes") or "")}
+                for mid, row in refill_map.items() if mid in active_by_id
+            ]
+            if details:
+                st.dataframe(details, width="stretch", hide_index=True)
+            else:
+                st.info("No refills recorded for this month.")
+
+    with members_tab:
         st.divider()
-        
-        # Bulk refill button - get selected IDs from checkbox keys
-        selected_ids = [m["id"] for m in today_refills if st.session_state.get(f"gift_refill_checkbox_{m['id']}", False)]
-        
-        refill_col1, refill_col2, refill_col3 = st.columns(3)
-        with refill_col1:
-            refill_credit_today = st.number_input(
-                "Refill month credit",
+        st.subheader("Member Actions")
+        st.caption("Choose a member, then open their actions.")
+
+        members_by_id = {str(m.get("id")): m for m in members}
+        if "member_actions_selected_id" not in st.session_state and members:
+            st.session_state["member_actions_selected_id"] = str(members[0].get("id"))
+
+        picker_col, filter_col = st.columns([1, 1])
+        with filter_col:
+            member_find = st.text_input(
+                "Find member",
+                key="member_action_find",
+                placeholder="Search name, locker, email, or phone",
+            ).strip().lower()
+
+        def _matches_member_filter(member: dict, query: str) -> bool:
+            if not query:
+                return True
+            full_name = f"{member.get('first_name', '')} {member.get('last_name', '')}".strip().lower()
+            reverse_name = f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", ").lower()
+            locker = str(member.get("locker") or "").strip().lower()
+            email = str(member.get("email") or "").strip().lower()
+            phone = str(member.get("phone") or "").strip().lower()
+            return query in full_name or query in reverse_name or query in locker or query in email or query in phone
+
+        filtered_member_ids = [
+            str(m.get("id"))
+            for m in members
+            if _matches_member_filter(m, member_find)
+        ]
+
+        if not filtered_member_ids:
+            st.info("No members match your search.")
+            filtered_member_ids = [str(m.get("id")) for m in members]
+
+        selected_member_id = str(st.session_state.get("member_actions_selected_id") or "")
+        if selected_member_id not in filtered_member_ids and filtered_member_ids:
+            selected_member_id = filtered_member_ids[0]
+            st.session_state["member_actions_selected_id"] = selected_member_id
+
+        with picker_col:
+            selected_member_id = st.selectbox(
+                "Selected member",
+                options=filtered_member_ids,
+                index=filtered_member_ids.index(selected_member_id) if selected_member_id in filtered_member_ids else 0,
+                format_func=lambda mid: (
+                    f"{member_locker_label(members_by_id[mid])} | "
+                    f"{members_by_id[mid].get('status', '')} | "
+                    f"{member_active_months(members_by_id[mid], today)} mo"
+                ),
+                key="member_action_picker",
+            )
+            st.session_state["member_actions_selected_id"] = selected_member_id
+
+        open_member_actions = st.button(
+            "Open member actions",
+            type="primary",
+            disabled=not bool(members),
+        )
+
+    with communications_tab:
+        st.divider()
+        st.subheader("Communications")
+        pending_comms_reset = st.session_state.pop("pending_communications_widget_reset", None)
+        if isinstance(pending_comms_reset, dict):
+            reset_widget_state(pending_comms_reset)
+        st.caption("Send email campaigns and manage member renewal reminders.")
+        render_member_communications_section(pg, members)
+
+    current_month = month_start_for()
+
+    @st.dialog("Member Actions")
+    def show_selected_member_actions():
+        st.divider()
+        selected = members_by_id.get(str(st.session_state.get("member_actions_selected_id")))
+        if not selected:
+            selected = members[0]
+            st.session_state["member_actions_selected_id"] = str(selected.get("id"))
+
+        st.caption(
+            f"Editing {selected.get('first_name', '')} {selected.get('last_name', '')} | "
+            f"Active for {member_active_months(selected, today)} month(s)"
+        )
+
+        selected_history = fetch_member_monthly_drinks(pg, member_id=selected["id"])
+        if selected_history:
+            latest_row = None
+            for row in selected_history:
+                if str(row.get("month_start")) == current_month:
+                    latest_row = row
+                    break
+            if latest_row is None:
+                latest_row = selected_history[0]
+
+            s_alc = int(latest_row.get("alcoholic_drinks") or 0)
+            s_non_alc = int(latest_row.get("non_alcoholic_drinks") or 0)
+            s_total = int(latest_row.get("total_drinks") or (s_alc + s_non_alc))
+            st.caption(
+                f"{selected['first_name']} {selected['last_name']} in {month_label(str(latest_row.get('month_start')))}: "
+                f"{s_alc} alcoholic, {s_non_alc} non-alcoholic, {s_total} total"
+            )
+
+        linked_sales = [
+            sale
+            for sale in sales
+            if resolve_sale_member_id(sale, loyalty_customers) == str(selected["id"])
+        ]
+        if linked_sales:
+            latest_sale_month = month_label(sale_month_start(linked_sales[0].get("created_at", "")))
+            st.caption(
+                f"Linked purchase history: {len(linked_sales)} sale(s) found, latest in {latest_sale_month}."
+            )
+            base_url = str(cigarpos_cfg.get("base_url") or "").strip()
+            if base_url:
+                st.markdown(f"CigarPOS portal: [{base_url}]({base_url})")
+        else:
+            st.info("No linked POS purchase history found for this member yet.")
+
+        if "_member_edit_undo" not in st.session_state:
+            try:
+                st.session_state["_member_edit_undo"] = load_member_edit_undo(pg)
+            except Exception:
+                st.session_state["_member_edit_undo"] = []
+        undo_stack = st.session_state["_member_edit_undo"]
+
+        col_pay, col_edit, col_del = st.columns(3)
+
+        with col_pay:
+            pay_months = st.number_input(
+                "Renewal periods paid",
                 min_value=1,
                 max_value=12,
                 value=1,
                 step=1,
-                key="gift_refill_today_credit_months",
-                help="Use 2 if this refill should count for two months.",
+                key="pay_months",
+                help="For monthly plans use 1 for a normal monthly renewal. For annual plans use 1 for one full year.",
             )
-            if st.button("✓ Mark Selected as Refilled", disabled=not selected_ids, type="primary", use_container_width=True):
-                success_count = 0
-                error_messages = []
-                for member_id in selected_ids:
-                    success, error = update_member_gift_card_refill_date(
-                        pg,
-                        member_id,
-                        str(today),
-                        credit_months=int(refill_credit_today),
-                    )
-                    if success:
-                        success_count += 1
-                    else:
-                        error_messages.append(f"Member {member_id}: {error}")
-                
-                if success_count > 0:
-                    st.success(f"✓ Marked {success_count} member(s) as refilled!")
-                    st.rerun()
-                
-                if error_messages:
-                    st.error("Errors: " + "; ".join(error_messages))
-        
-        with refill_col2:
-            if st.button("⊘ Skip Selected", disabled=not selected_ids, use_container_width=True):
-                success_count = 0
-                error_messages = []
-                for member_id in selected_ids:
-                    success, error = skip_member_gift_card_refill(pg, member_id)
-                    if success:
-                        success_count += 1
-                    else:
-                        error_messages.append(f"Member {member_id}: {error}")
-                
-                if success_count > 0:
-                    st.success(f"✓ Skipped {success_count} member(s)!")
-                    st.rerun()
-                
-                if error_messages:
-                    st.error("Errors: " + "; ".join(error_messages))
-        
-        with refill_col3:
-            if st.button("Clear Selection", use_container_width=True):
-                for m in today_refills:
-                    st.session_state[f"gift_refill_checkbox_{m['id']}"] = False
-                st.rerun()
-
-    st.divider()
-    st.subheader("Monthly Gift Card Refill Tracker")
-    st.caption("Track who received their monthly gift card so each member is only refilled once per month.")
-
-    refill_month_options = []
-    for row in refill_rows_all:
-        mstart = str(row.get("month_start") or "").strip()
-        if mstart and mstart not in refill_month_options:
-            refill_month_options.append(mstart)
-    current_refill_month = month_start_for()
-    if current_refill_month not in refill_month_options:
-        refill_month_options.insert(0, current_refill_month)
-
-    refill_month = st.selectbox(
-        "Refill month",
-        refill_month_options,
-        format_func=lambda x: month_label(x),
-        key="gift_refill_month",
-    )
-    refill_amount = st.number_input(
-        "Gift card amount",
-        min_value=0.0,
-        value=25.0,
-        step=1.0,
-        key="gift_refill_amount",
-    )
-    refill_note = st.text_input("Refill note (optional)", key="gift_refill_note")
-    refill_credit_months = st.number_input(
-        "Refill month credit",
-        min_value=1,
-        max_value=12,
-        value=1,
-        step=1,
-        key="gift_refill_credit_months",
-        help="Use 2 when one refill should count for two months.",
-    )
-
-    refill_rows = fetch_member_monthly_refills(pg, month_start=refill_month)
-    refill_map = {str(r.get("member_id")): r for r in refill_rows}
-    active_members = [m for m in members if str(m.get("status") or "").strip().lower() == "active"]
-
-    st.divider()
-    st.subheader("Quick Member Editor")
-    st.caption("Click a member to jump into editing details and marking their renewal as paid.")
-
-    members_by_id = {str(m.get("id")): m for m in members}
-    if "member_actions_selected_id" not in st.session_state and members:
-        st.session_state["member_actions_selected_id"] = str(members[0].get("id"))
-
-    picker_col, filter_col = st.columns([1, 1])
-    with filter_col:
-        member_find = st.text_input(
-            "Find member",
-            key="member_action_find",
-            placeholder="Search name, locker, email, or phone",
-        ).strip().lower()
-
-    def _matches_member_filter(member: dict, query: str) -> bool:
-        if not query:
-            return True
-        full_name = f"{member.get('first_name', '')} {member.get('last_name', '')}".strip().lower()
-        reverse_name = f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", ").lower()
-        locker = str(member.get("locker") or "").strip().lower()
-        email = str(member.get("email") or "").strip().lower()
-        phone = str(member.get("phone") or "").strip().lower()
-        return query in full_name or query in reverse_name or query in locker or query in email or query in phone
-
-    filtered_member_ids = [
-        str(m.get("id"))
-        for m in members
-        if _matches_member_filter(m, member_find)
-    ]
-
-    if not filtered_member_ids:
-        st.info("No members match your search.")
-        filtered_member_ids = [str(m.get("id")) for m in members]
-
-    selected_member_id = str(st.session_state.get("member_actions_selected_id") or "")
-    if selected_member_id not in filtered_member_ids and filtered_member_ids:
-        selected_member_id = filtered_member_ids[0]
-        st.session_state["member_actions_selected_id"] = selected_member_id
-
-    with picker_col:
-        selected_member_id = st.selectbox(
-            "Selected member",
-            options=filtered_member_ids,
-            index=filtered_member_ids.index(selected_member_id) if selected_member_id in filtered_member_ids else 0,
-            format_func=lambda mid: (
-                f"{member_locker_label(members_by_id[mid])} | "
-                f"{members_by_id[mid].get('status', '')} | "
-                f"{member_active_months(members_by_id[mid], today)} mo"
-            ),
-            key="member_action_picker",
-        )
-        st.session_state["member_actions_selected_id"] = selected_member_id
-
-    quick_pick_ids = filtered_member_ids[:9]
-    if quick_pick_ids:
-        st.caption("Quick click:")
-        quick_cols = st.columns(3)
-        for idx, mid in enumerate(quick_pick_ids):
-            member = members_by_id[mid]
-            with quick_cols[idx % 3]:
-                if st.button(
-                    f"{member.get('last_name', '')}, {member.get('first_name', '')}",
-                    key=f"quick_pick_member_{mid}",
-                    width="stretch",
-                ):
-                    st.session_state["member_actions_selected_id"] = mid
-                    st.rerun()
-
-    st.caption("Gift card number manager")
-    card_member_options = {
-        member_locker_label(m): m
-        for m in active_members
-    }
-    if card_member_options:
-        selected_card_member_label = st.selectbox(
-            "Member card profile",
-            list(card_member_options.keys()),
-            key="gift_card_member_pick",
-        )
-        selected_card_member = card_member_options[selected_card_member_label]
-        selected_card_member_id = str(selected_card_member.get("id"))
-        selected_card_number = str(selected_card_member.get("gift_card_number") or "")
-
-        with st.form(key=f"gift_card_profile_form_{selected_card_member_id}"):
-            card_number_value = st.text_input(
-                "Gift card number",
-                value=selected_card_number,
-                key=f"gift_card_number_input_{selected_card_member_id}",
-                help="Save or update the member's card number. Leave blank to clear it.",
-            )
-            save_card_profile = st.form_submit_button("Save Gift Card Number")
-
-        if save_card_profile:
-            ok, err = update_member_gift_card_number(
-                pg,
-                selected_card_member_id,
-                card_number_value,
-            )
-            if ok:
-                st.success("Gift card number saved.")
-                st.rerun()
-            else:
-                st.error(
-                    "Could not save gift card number. If this is the first time using this feature, "
-                    "run supabase/create_members_table.sql in Supabase SQL editor. "
-                    f"Details: {err}"
-                )
-    else:
-        st.info("No active members available for gift card number management yet.")
-
-    refilled_ids = [str(m.get("id")) for m in active_members if str(m.get("id")) in refill_map]
-    pending_ids = [str(m.get("id")) for m in active_members if str(m.get("id")) not in refill_map]
-
-    metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric("Active members", len(active_members))
-    metric_2.metric("Refilled", len(refilled_ids))
-    metric_3.metric("Pending", len(pending_ids))
-
-    active_lookup = {str(m.get("id")): m for m in active_members}
-    c_refill, c_unfill = st.columns(2)
-
-    with c_refill:
-        mark_ids = st.multiselect(
-            "Mark as refilled",
-            options=pending_ids,
-            format_func=lambda mid: member_locker_label(active_lookup[mid]),
-            key="gift_refill_mark_ids",
-        )
-        if st.button("Mark Selected Refilled", key="gift_refill_mark_btn"):
-            if not mark_ids:
-                st.warning("Select at least one member to mark as refilled.")
-            else:
-                marked = 0
-                error_text = ""
-                for mid in mark_ids:
-                    ok, err = mark_member_monthly_refill(
-                        pg,
-                        mid,
-                        month_start=refill_month,
-                        amount=float(refill_amount),
-                        notes=refill_note,
-                        credit_months=int(refill_credit_months),
-                    )
-                    if ok:
-                        marked += 1
-                    else:
-                        error_text = err or "Unknown error"
-                        break
-                if error_text:
-                    st.error(
-                        "Could not save refill tracker data. If this is the first time using this feature, "
-                        "run supabase/create_member_monthly_refills_table.sql in Supabase SQL editor. "
-                        f"Details: {error_text}"
-                    )
-                else:
-                    st.success(f"Marked {marked} member(s) as refilled for {month_label(refill_month)}.")
-                    queue_widget_reset(
-                        {
-                            "gift_refill_mark_ids": [],
-                            "gift_refill_note": "",
-                        },
-                        "pending_members_widget_reset",
-                    )
-                    st.rerun()
-
-        if st.button("Mark All Pending", key="gift_refill_mark_all_btn", disabled=not pending_ids):
-            marked = 0
-            error_text = ""
-            for mid in pending_ids:
-                ok, err = mark_member_monthly_refill(
-                    pg,
-                    mid,
-                    month_start=refill_month,
-                    amount=float(refill_amount),
-                    notes=refill_note,
-                    credit_months=int(refill_credit_months),
-                )
-                if ok:
-                    marked += 1
-                else:
-                    error_text = err or "Unknown error"
-                    break
-            if error_text:
-                st.error(
-                    "Could not save refill tracker data. If this is the first time using this feature, "
-                    "run supabase/create_member_monthly_refills_table.sql in Supabase SQL editor. "
-                    f"Details: {error_text}"
-                )
-            else:
-                st.success(f"Marked all pending members ({marked}) as refilled for {month_label(refill_month)}.")
-                queue_widget_reset(
-                    {
-                        "gift_refill_note": "",
-                    },
-                    "pending_members_widget_reset",
-                )
-                st.rerun()
-
-    with c_unfill:
-        unmark_ids = st.multiselect(
-            "Undo refill status",
-            options=refilled_ids,
-            format_func=lambda mid: member_locker_label(active_lookup[mid]),
-            key="gift_refill_unmark_ids",
-        )
-        if st.button("Undo Selected", key="gift_refill_unmark_btn"):
-            if not unmark_ids:
-                st.warning("Select at least one member to undo.")
-            else:
-                undone = 0
-                error_text = ""
-                for mid in unmark_ids:
-                    ok, err = unmark_member_monthly_refill(pg, mid, month_start=refill_month)
-                    if ok:
-                        undone += 1
-                    else:
-                        error_text = err or "Unknown error"
-                        break
-                if error_text:
-                    st.error(f"Failed to undo refill status: {error_text}")
-                else:
-                    st.success(f"Undid refill status for {undone} member(s).")
-                    queue_widget_reset(
-                        {
-                            "gift_refill_unmark_ids": [],
-                        },
-                        "pending_members_widget_reset",
-                    )
-                    st.rerun()
-
-    tracker_rows = []
-    matched_count = 0
-    behind_count = 0
-    overfilled_count = 0
-    behind_members: list[tuple[str, int]] = []
-    for member in sorted(active_members, key=_locker_sort_key):
-        member_id = str(member.get("id"))
-        refill = refill_map.get(member_id)
-        active_months_count = member_active_months(member, today)
-        refilled_months_count = int(refill_months_by_member.get(member_id, 0))
-        refill_delta = active_months_count - refilled_months_count
-        if refill_delta == 0:
-            refill_match = "Matched"
-            matched_count += 1
-        elif refill_delta > 0:
-            refill_match = f"Behind {refill_delta}"
-            behind_count += 1
-            behind_members.append((member_id, int(refill_delta)))
-        else:
-            refill_match = f"Overfilled {abs(refill_delta)}"
-            overfilled_count += 1
-        tracker_rows.append(
-            {
-                "Member": f"{member.get('last_name', '')}, {member.get('first_name', '')}",
-                "Locker": str(member.get("locker") or "").strip() or "—",
-                "Active Months": active_months_count,
-                "Refilled Months": refilled_months_count,
-                "Refill Delta": refill_delta,
-                "Refill Match": refill_match,
-                "Next Bill": str(member.get("next_billing_date") or ""),
-                "Gift Card #": str(member.get("gift_card_number") or ""),
-                "Refilled": "Yes" if refill else "No",
-                "Amount": float(refill.get("amount") or 0.0) if refill else 0.0,
-                "Refilled At": str(refill.get("refilled_at") or "") if refill else "",
-                "Note": str(refill.get("notes") or "") if refill else "",
-            }
-        )
-
-    rm1, rm2, rm3 = st.columns(3)
-    rm1.metric("Matched", matched_count)
-    rm2.metric("Behind", behind_count)
-    rm3.metric("Overfilled", overfilled_count)
-
-    if behind_members:
-        total_missing_months = sum(delta for _, delta in behind_members)
-        st.warning(
-            f"{behind_count} member(s) are behind by {total_missing_months} total month(s). "
-            f"Use the catch-up action below if these are historical credits already given."
-        )
-        if st.button(
-            "Apply Catch-Up Credits (Tracking Only)",
-            key="gift_refill_apply_catchup_btn",
-            help="Adds missing month credits to the selected refill month without adding card value.",
-        ):
-            adjusted = 0
-            failures = []
-            for member_id, delta in behind_members:
-                ok, err = apply_refill_credit_adjustment(
-                    pg,
-                    member_id,
-                    delta,
-                    month_start=refill_month,
-                )
-                if ok:
-                    adjusted += 1
-                else:
-                    failures.append(f"{member_id}: {err}")
-
-            if adjusted:
-                st.success(f"Applied catch-up credits for {adjusted} member(s) in {month_label(refill_month)}.")
-            if failures:
-                st.error("Some catch-up adjustments failed: " + "; ".join(failures[:3]))
-            st.rerun()
-
-    if tracker_rows:
-        tracker_df = pd.DataFrame(tracker_rows)
-
-        def _style_refill_match(value):
-            label = str(value or "")
-            if label.startswith("Matched"):
-                return "background-color: #eaf8ef; color: #1b7f3a; font-weight: 600;"
-            if label.startswith("Behind"):
-                return "background-color: #fff7e8; color: #9a6700; font-weight: 600;"
-            if label.startswith("Overfilled"):
-                return "background-color: #ffeef0; color: #b42318; font-weight: 600;"
-            return ""
-
-        def _style_refill_delta(value):
-            try:
-                delta = int(value)
-            except Exception:
-                return ""
-            if delta == 0:
-                return "background-color: #eaf8ef; color: #1b7f3a; font-weight: 600;"
-            if delta > 0:
-                return "background-color: #fff7e8; color: #9a6700; font-weight: 600;"
-            return "background-color: #ffeef0; color: #b42318; font-weight: 600;"
-
-        styled_tracker_df = tracker_df.style
-        styled_tracker_df = styled_tracker_df.map(_style_refill_match, subset=["Refill Match"])
-        styled_tracker_df = styled_tracker_df.map(_style_refill_delta, subset=["Refill Delta"])
-        st.dataframe(styled_tracker_df, width="stretch", hide_index=True)
-    else:
-        st.dataframe(tracker_rows, width="stretch", hide_index=True)
-
-    st.divider()
-    st.subheader("Communications")
-    st.caption("Mass email and text tools moved to the Campaigns page in the sidebar.")
-
-    by_id = {str(m.get("id")): m for m in members}
-    current_month = month_start_for()
-
-    st.divider()
-    show_member_drink_tracker_section = _bool_setting(get_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY), False)
-    if show_member_drink_tracker_section:
-        st.subheader("Drink Tracker")
-        month_options = []
-        month_rows_all = fetch_member_monthly_drinks(pg)
-        for r in month_rows_all:
-            mstart = str(r.get("month_start") or "").strip()
-            if mstart and mstart not in month_options:
-                month_options.append(mstart)
-        if current_month not in month_options:
-            month_options.insert(0, current_month)
-        month_labels = {m: month_label(m) for m in month_options}
-        selected_month = st.selectbox(
-            "Overview month",
-            month_options,
-            format_func=lambda x: month_labels.get(x, x),
-            key="member_drink_overview_month",
-        )
-
-        selected_month_rows = fetch_member_monthly_drinks(pg, month_start=selected_month)
-        overview_rows = []
-        export_month_rows = []
-        total_alc = 0
-        total_non_alc = 0
-        total_drinks = 0
-        for r in selected_month_rows:
-            mid = str(r.get("member_id"))
-            member = by_id.get(mid, {})
-            alc = int(r.get("alcoholic_drinks") or 0)
-            non_alc = int(r.get("non_alcoholic_drinks") or 0)
-            tot = int(r.get("total_drinks") or (alc + non_alc))
-            total_alc += alc
-            total_non_alc += non_alc
-            total_drinks += tot
-            overview_rows.append(
-                {
-                    "Member": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
-                    "Alcoholic": alc,
-                    "Non-Alcoholic": non_alc,
-                    "Total": tot,
-                }
-            )
-            export_month_rows.append(
-                {
-                    "month_start": selected_month,
-                    "month_label": month_labels.get(selected_month, selected_month),
-                    "member_id": mid,
-                    "member_name": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
-                    "alcoholic_drinks": alc,
-                    "non_alcoholic_drinks": non_alc,
-                    "total_drinks": tot,
-                }
-            )
-
-        k1, k2, k3 = st.columns(3)
-        k1.metric(f"Alcoholic ({month_labels.get(selected_month, selected_month)})", total_alc)
-        k2.metric(f"Non-Alcoholic ({month_labels.get(selected_month, selected_month)})", total_non_alc)
-        k3.metric(f"Total ({month_labels.get(selected_month, selected_month)})", total_drinks)
-
-        month_download_name = (
-            f"member_drinks_{selected_month}_{datetime.date.today().strftime('%Y%m%d')}.csv"
-        )
-        month_export_text = ""
-        if export_month_rows:
-            month_export_buf = io.StringIO()
-            month_writer = csv.DictWriter(
-                month_export_buf,
-                fieldnames=[
-                    "month_start",
-                    "month_label",
-                    "member_id",
-                    "member_name",
-                    "alcoholic_drinks",
-                    "non_alcoholic_drinks",
-                    "total_drinks",
-                ],
-            )
-            month_writer.writeheader()
-            for row in sorted(export_month_rows, key=lambda x: x["total_drinks"], reverse=True):
-                month_writer.writerow(row)
-            month_export_text = month_export_buf.getvalue()
-
-        all_export_rows = []
-        for r in month_rows_all:
-            mstart = str(r.get("month_start") or "")
-            mid = str(r.get("member_id") or "")
-            member = by_id.get(mid, {})
-            alc = int(r.get("alcoholic_drinks") or 0)
-            non_alc = int(r.get("non_alcoholic_drinks") or 0)
-            tot = int(r.get("total_drinks") or (alc + non_alc))
-            all_export_rows.append(
-                {
-                    "month_start": mstart,
-                    "month_label": month_label(mstart),
-                    "member_id": mid,
-                    "member_name": f"{member.get('last_name', '')}, {member.get('first_name', '')}".strip(", "),
-                    "alcoholic_drinks": alc,
-                    "non_alcoholic_drinks": non_alc,
-                    "total_drinks": tot,
-                }
-            )
-
-        all_download_name = f"member_drinks_all_months_{datetime.date.today().strftime('%Y%m%d')}.csv"
-        all_export_text = ""
-        if all_export_rows:
-            all_export_buf = io.StringIO()
-            all_writer = csv.DictWriter(
-                all_export_buf,
-                fieldnames=[
-                    "month_start",
-                    "month_label",
-                    "member_id",
-                    "member_name",
-                    "alcoholic_drinks",
-                    "non_alcoholic_drinks",
-                    "total_drinks",
-                ],
-            )
-            all_writer.writeheader()
-            for row in sorted(
-                all_export_rows,
-                key=lambda x: (x["month_start"], x["total_drinks"]),
-                reverse=True,
-            ):
-                all_writer.writerow(row)
-            all_export_text = all_export_buf.getvalue()
-
-        d1, d2 = st.columns(2)
-        d1.download_button(
-            "Download Selected Month CSV",
-            data=month_export_text,
-            file_name=month_download_name,
-            mime="text/csv",
-            disabled=not bool(month_export_text),
-            width="stretch",
-        )
-        d2.download_button(
-            "Download All Months CSV",
-            data=all_export_text,
-            file_name=all_download_name,
-            mime="text/csv",
-            disabled=not bool(all_export_text),
-            width="stretch",
-        )
-
-        if overview_rows:
-            st.dataframe(
-                sorted(overview_rows, key=lambda x: x["Total"], reverse=True),
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.info("No drink history for this month yet.")
-    else:
-        st.subheader("Drink Tracker")
-        st.caption("Hidden. Enable it in Settings -> Display.")
-
-    st.divider()
-    show_member_margin_section = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), False)
-    if show_member_margin_section:
-        render_member_purchase_margins(sales, loyalty_customers, by_id, current_month)
-    else:
-        st.subheader("Member Purchase Margins")
-        st.caption("Hidden. Enable it in Settings -> Display.")
-
-    st.divider()
-    st.subheader("Selected Member Actions")
-    selected = members_by_id.get(str(st.session_state.get("member_actions_selected_id")))
-    if not selected:
-        selected = members[0]
-        st.session_state["member_actions_selected_id"] = str(selected.get("id"))
-
-    st.caption(
-        f"Editing {selected.get('first_name', '')} {selected.get('last_name', '')} | "
-        f"Active for {member_active_months(selected, today)} month(s)"
-    )
-
-    selected_history = fetch_member_monthly_drinks(pg, member_id=selected["id"])
-    if selected_history:
-        latest_row = None
-        for row in selected_history:
-            if str(row.get("month_start")) == current_month:
-                latest_row = row
-                break
-        if latest_row is None:
-            latest_row = selected_history[0]
-
-        s_alc = int(latest_row.get("alcoholic_drinks") or 0)
-        s_non_alc = int(latest_row.get("non_alcoholic_drinks") or 0)
-        s_total = int(latest_row.get("total_drinks") or (s_alc + s_non_alc))
-        st.caption(
-            f"{selected['first_name']} {selected['last_name']} in {month_label(str(latest_row.get('month_start')))}: "
-            f"{s_alc} alcoholic, {s_non_alc} non-alcoholic, {s_total} total"
-        )
-
-    linked_sales = [
-        sale
-        for sale in sales
-        if resolve_sale_member_id(sale, loyalty_customers) == str(selected["id"])
-    ]
-    if linked_sales:
-        latest_sale_month = month_label(sale_month_start(linked_sales[0].get("created_at", "")))
-        st.caption(
-            f"Linked purchase history: {len(linked_sales)} sale(s) found, latest in {latest_sale_month}."
-        )
-        base_url = str(cigarpos_cfg.get("base_url") or "").strip()
-        if base_url:
-            st.markdown(f"CigarPOS portal: [{base_url}]({base_url})")
-    else:
-        st.info("No linked POS purchase history found for this member yet.")
-
-    if "_member_edit_undo" not in st.session_state:
-        try:
-            st.session_state["_member_edit_undo"] = load_member_edit_undo(pg)
-        except Exception:
-            st.session_state["_member_edit_undo"] = []
-    undo_stack = st.session_state["_member_edit_undo"]
-
-    col_pay, col_edit, col_del = st.columns(3)
-
-    with col_pay:
-        pay_months = st.number_input(
-            "Renewal periods paid",
-            min_value=1,
-            max_value=12,
-            value=1,
-            step=1,
-            key="pay_months",
-            help="For monthly plans use 1 for a normal monthly renewal. For annual plans use 1 for one full year.",
-        )
-        if st.button("Mark Renewal Paid", type="primary"):
-            try:
-                process_payment(
-                    pg, selected["id"], selected["tier"],
-                    selected["next_billing_date"], int(pay_months)
-                )
-                st.success("Renewal saved and next billing date updated.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
-
-    with col_edit:
-        with st.expander("Edit member"):
-            mid = selected["id"]
-            status_opts = ["Active", "Past Due", "Inactive", "Canceled"]
-            tier_opts = ["Annual", "Monthly"]
-            e_fn = st.text_input("First Name", value=selected["first_name"], key=f"e_fn_{mid}")
-            e_ln = st.text_input("Last Name", value=selected["last_name"], key=f"e_ln_{mid}")
-            e_em = st.text_input("Email", value=selected.get("email", ""), key=f"e_em_{mid}")
-            e_ph = st.text_input("Phone", value=selected.get("phone", ""), key=f"e_ph_{mid}")
-            e_lk = st.text_input("Locker", value=selected.get("locker", ""), key=f"e_lk_{mid}")
-            _cur_status = selected.get("status", "Active")
-            e_st = st.selectbox(
-                "Status", status_opts,
-                index=status_opts.index(_cur_status) if _cur_status in status_opts else 0,
-                key=f"e_st_{mid}",
-            )
-            _cur_tier = selected.get("tier", "Annual")
-            e_tier = st.selectbox(
-                "Tier", tier_opts,
-                index=tier_opts.index(_cur_tier) if _cur_tier in tier_opts else 0,
-                key=f"e_tier_{mid}",
-            )
-            if st.button("Save Changes", key=f"save_member_{mid}"):
+            if st.button("Mark Renewal Paid", type="primary"):
                 try:
-                    prev_snapshot = {
-                        "id": selected["id"],
-                        "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "first_name": selected.get("first_name", ""),
-                        "last_name": selected.get("last_name", ""),
-                        "email": selected.get("email", ""),
-                        "phone": selected.get("phone", ""),
-                        "locker": selected.get("locker", ""),
-                        "status": selected.get("status", "Active"),
-                        "tier": selected.get("tier", "Annual"),
-                    }
-                    update_member(pg, selected["id"], e_fn, e_ln, e_em, e_ph, e_lk, e_st, e_tier)
-                    undo_stack.append(prev_snapshot)
-                    if len(undo_stack) > MAX_MEMBER_EDIT_UNDO:
-                        del undo_stack[:-MAX_MEMBER_EDIT_UNDO]
-                    save_member_edit_undo(pg, undo_stack)
-                    clear_member_edit_widget_state(mid)
-                    st.success("Updated.")
+                    process_payment(
+                        pg, selected["id"], selected["tier"],
+                        selected["next_billing_date"], int(pay_months)
+                    )
+                    st.success("Renewal saved and next billing date updated.")
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Failed: {exc}")
 
-            undo_index = None
-            for idx in range(len(undo_stack) - 1, -1, -1):
-                if undo_stack[idx].get("id") == mid:
-                    undo_index = idx
-                    break
-
-            member_snaps = [s for s in undo_stack if s.get("id") == mid]
-            restore_index = None
-            if member_snaps:
-                preview_rows = []
-                for snap in reversed(member_snaps[-5:]):
-                    preview_rows.append(
-                        {
-                            "Saved At": snap.get("saved_at", "(unknown)"),
-                            "Name": f"{snap.get('last_name', '')}, {snap.get('first_name', '')}".strip(", "),
-                            "Email": snap.get("email", ""),
-                            "Phone": snap.get("phone", ""),
-                            "Locker": snap.get("locker", ""),
-                            "Status": snap.get("status", "Active"),
-                            "Tier": snap.get("tier", "Annual"),
-                        }
-                    )
-                st.caption("Recent undo snapshots (newest first)")
-                st.dataframe(preview_rows, width="stretch", hide_index=True)
-
-                snap_labels = []
-                snap_map = {}
-                for idx in range(len(undo_stack) - 1, -1, -1):
-                    snap = undo_stack[idx]
-                    if snap.get("id") != mid:
-                        continue
-                    label = (
-                        f"{snap.get('saved_at', '(unknown)')} | "
-                        f"{snap.get('last_name', '')}, {snap.get('first_name', '')} | "
-                        f"Phone: {snap.get('phone', '') or '(blank)'} | "
-                        f"Status: {snap.get('status', 'Active')}"
-                    )
-                    if label in snap_map:
-                        label = f"{label} [#{idx}]"
-                    snap_labels.append(label)
-                    snap_map[label] = idx
-
-                picked_label = st.selectbox(
-                    "Snapshot to restore",
-                    snap_labels,
-                    key=f"restore_pick_{mid}",
+        with col_edit:
+            with st.expander("Edit member"):
+                mid = selected["id"]
+                status_opts = ["Active", "Past Due", "Inactive", "Canceled"]
+                tier_opts = ["Annual", "Monthly"]
+                e_fn = st.text_input("First Name", value=selected["first_name"], key=f"e_fn_{mid}")
+                e_ln = st.text_input("Last Name", value=selected["last_name"], key=f"e_ln_{mid}")
+                e_em = st.text_input("Email", value=selected.get("email", ""), key=f"e_em_{mid}")
+                e_ph = st.text_input("Phone", value=selected.get("phone", ""), key=f"e_ph_{mid}")
+                e_lk = st.text_input("Locker", value=selected.get("locker", ""), key=f"e_lk_{mid}")
+                _cur_status = selected.get("status", "Active")
+                e_st = st.selectbox(
+                    "Status", status_opts,
+                    index=status_opts.index(_cur_status) if _cur_status in status_opts else 0,
+                    key=f"e_st_{mid}",
                 )
-                restore_index = snap_map[picked_label]
-                if st.button("Restore Selected Snapshot", key=f"restore_snap_{mid}"):
+                _cur_tier = selected.get("tier", "Annual")
+                e_tier = st.selectbox(
+                    "Tier", tier_opts,
+                    index=tier_opts.index(_cur_tier) if _cur_tier in tier_opts else 0,
+                    key=f"e_tier_{mid}",
+                )
+                if st.button("Save Changes", key=f"save_member_{mid}"):
                     try:
-                        snap = undo_stack[restore_index]
+                        prev_snapshot = {
+                            "id": selected["id"],
+                            "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "first_name": selected.get("first_name", ""),
+                            "last_name": selected.get("last_name", ""),
+                            "email": selected.get("email", ""),
+                            "phone": selected.get("phone", ""),
+                            "locker": selected.get("locker", ""),
+                            "status": selected.get("status", "Active"),
+                            "tier": selected.get("tier", "Annual"),
+                        }
+                        update_member(pg, selected["id"], e_fn, e_ln, e_em, e_ph, e_lk, e_st, e_tier)
+                        undo_stack.append(prev_snapshot)
+                        if len(undo_stack) > MAX_MEMBER_EDIT_UNDO:
+                            del undo_stack[:-MAX_MEMBER_EDIT_UNDO]
+                        save_member_edit_undo(pg, undo_stack)
+                        clear_member_edit_widget_state(mid)
+                        st.success("Updated.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Failed: {exc}")
+
+                undo_index = None
+                for idx in range(len(undo_stack) - 1, -1, -1):
+                    if undo_stack[idx].get("id") == mid:
+                        undo_index = idx
+                        break
+
+                member_snaps = [s for s in undo_stack if s.get("id") == mid]
+                restore_index = None
+                if member_snaps:
+                    preview_rows = []
+                    for snap in reversed(member_snaps[-5:]):
+                        preview_rows.append(
+                            {
+                                "Saved At": snap.get("saved_at", "(unknown)"),
+                                "Name": f"{snap.get('last_name', '')}, {snap.get('first_name', '')}".strip(", "),
+                                "Email": snap.get("email", ""),
+                                "Phone": snap.get("phone", ""),
+                                "Locker": snap.get("locker", ""),
+                                "Status": snap.get("status", "Active"),
+                                "Tier": snap.get("tier", "Annual"),
+                            }
+                        )
+                    st.caption("Recent undo snapshots (newest first)")
+                    st.dataframe(preview_rows, width="stretch", hide_index=True)
+
+                    snap_labels = []
+                    snap_map = {}
+                    for idx in range(len(undo_stack) - 1, -1, -1):
+                        snap = undo_stack[idx]
+                        if snap.get("id") != mid:
+                            continue
+                        label = (
+                            f"{snap.get('saved_at', '(unknown)')} | "
+                            f"{snap.get('last_name', '')}, {snap.get('first_name', '')} | "
+                            f"Phone: {snap.get('phone', '') or '(blank)'} | "
+                            f"Status: {snap.get('status', 'Active')}"
+                        )
+                        if label in snap_map:
+                            label = f"{label} [#{idx}]"
+                        snap_labels.append(label)
+                        snap_map[label] = idx
+
+                    picked_label = st.selectbox(
+                        "Snapshot to restore",
+                        snap_labels,
+                        key=f"restore_pick_{mid}",
+                    )
+                    restore_index = snap_map[picked_label]
+                    if st.button("Restore Selected Snapshot", key=f"restore_snap_{mid}"):
+                        try:
+                            snap = undo_stack[restore_index]
+                            update_member(
+                                pg,
+                                snap["id"],
+                                snap.get("first_name", ""),
+                                snap.get("last_name", ""),
+                                snap.get("email", ""),
+                                snap.get("phone", ""),
+                                snap.get("locker", ""),
+                                snap.get("status", "Active"),
+                            )
+                            undo_stack.pop(restore_index)
+                            save_member_edit_undo(pg, undo_stack)
+                            clear_member_edit_widget_state(mid)
+                            st.success("Selected snapshot restored.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Restore failed: {exc}")
+
+                if undo_index is not None:
+                    st.caption("Undo will restore the most recent saved values for this member.")
+                if st.button(
+                    "Undo Last Edit",
+                    key=f"undo_member_{mid}",
+                    disabled=undo_index is None,
+                ):
+                    try:
+                        snap = undo_stack[undo_index]
                         update_member(
                             pg,
                             snap["id"],
@@ -7792,143 +7147,120 @@ def page_members(pg: SyncPostgrestClient):
                             snap.get("locker", ""),
                             snap.get("status", "Active"),
                         )
-                        undo_stack.pop(restore_index)
+                        undo_stack.pop(undo_index)
                         save_member_edit_undo(pg, undo_stack)
                         clear_member_edit_widget_state(mid)
-                        st.success("Selected snapshot restored.")
+                        st.success("Last edit undone.")
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Restore failed: {exc}")
+                        st.error(f"Undo failed: {exc}")
 
-            if undo_index is not None:
-                st.caption("Undo will restore the most recent saved values for this member.")
-            if st.button(
-                "Undo Last Edit",
-                key=f"undo_member_{mid}",
-                disabled=undo_index is None,
-            ):
-                try:
-                    snap = undo_stack[undo_index]
-                    update_member(
-                        pg,
-                        snap["id"],
-                        snap.get("first_name", ""),
-                        snap.get("last_name", ""),
-                        snap.get("email", ""),
-                        snap.get("phone", ""),
-                        snap.get("locker", ""),
-                        snap.get("status", "Active"),
-                    )
-                    undo_stack.pop(undo_index)
-                    save_member_edit_undo(pg, undo_stack)
-                    clear_member_edit_widget_state(mid)
-                    st.success("Last edit undone.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Undo failed: {exc}")
-
-    with col_del:
-        st.write("")
-        st.write("")
-        if st.button("Remove Member", type="secondary"):
-            if st.session_state.get("confirm_delete") == selected["id"]:
-                try:
-                    delete_member(pg, selected["id"])
-                    st.session_state.pop("confirm_delete", None)
-                    st.success("Removed.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Failed: {exc}")
-            else:
-                st.session_state["confirm_delete"] = selected["id"]
-                st.warning("Click Remove again to confirm.")
-
-    st.divider()
-    st.subheader("Email Reminders")
-
-    try:
-        smtp = load_smtp_settings(pg)
-        templates = load_email_templates(pg)
-    except Exception:
-        smtp = {
-            "host": "",
-            "port": 0,
-            "security": "SSL",
-            "username": "",
-            "password": "",
-            "from_addr": "",
-        }
-        templates = EMAIL_TEMPLATE_DEFAULTS
-
-    if not smtp["host"] or not smtp["port"] or not smtp["from_addr"] or not smtp["password"]:
-        st.info("Configure SMTP settings in Settings before scanning.")
-    else:
-        auto_ran, auto_state, auto_stats = maybe_run_automated_member_reminders(
-            pg,
-            smtp,
-            templates,
-            members,
-        )
-        automatic_emails_enabled = _bool_setting(
-            get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False
-        )
-        auto_enabled = _bool_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY), False)
-        auto_interval = max(5, _int_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY), 60))
-        if automatic_emails_enabled and auto_enabled:
-            if auto_ran:
-                if int(auto_stats.get("sent", 0)) > 0:
-                    st.success(
-                        f"Automated reminders sent {int(auto_stats.get('sent', 0))} email(s). "
-                        f"Skipped: {int(auto_stats.get('skipped_no_email', 0))}, Failed: {int(auto_stats.get('failed', 0))}."
-                    )
-                elif int(auto_stats.get("pending", 0)) == 0:
-                    st.caption("Automated reminders checked: no reminders were due.")
-            elif auto_state == "throttled":
-                mins_left = int(auto_stats.get("minutes_remaining", 0))
-                st.caption(
-                    f"Automated reminders are enabled (every {auto_interval} min). "
-                    f"Next check in about {mins_left} min."
-                )
-        elif not automatic_emails_enabled:
-            st.caption("Automatic member emails are disabled in Settings.")
-
-        pending = get_pending_reminders(members, templates)
-        deliverable_pending = [p for p in pending if parseaddr(str(p.get("email") or "").strip())[1].strip()]
-        skipped_missing_email = len(pending) - len(deliverable_pending)
-
-        if not deliverable_pending:
-            st.success("No reminders due today.")
-        else:
-            st.write(f"**{len(deliverable_pending)} reminder(s) ready to send:**")
-            if skipped_missing_email:
-                st.caption(f"Skipped {skipped_missing_email} reminder(s) with no email address.")
-            for i, p in enumerate(deliverable_pending):
-                with st.expander(f"{p['subject']} → {p['email']}"):
-                    subj = st.text_input("Subject", value=p["subject"], key=f"subj_{i}")
-                    body = st.text_area("Body", value=p["body"], key=f"body_{i}")
-                    c_send, c_skip = st.columns(2)
-                    if c_send.button("Send", key=f"send_{i}"):
-                        try:
-                            send_email(
-                                smtp["host"],
-                                int(smtp["port"]),
-                                smtp["username"],
-                                smtp["password"],
-                                p["email"],
-                                subj,
-                                body,
-                                security=smtp["security"],
-                                from_addr=smtp["from_addr"],
-                            )
-                            pg.from_("members").update({"last_reminder": p["target"]}).eq(
-                                "id", p["id"]
-                            ).execute()
-                            st.success("Sent.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Send failed: {exc}")
-                    if c_skip.button("Skip", key=f"skip_{i}"):
+        with col_del:
+            st.write("")
+            st.write("")
+            if st.button("Remove Member", type="secondary"):
+                if st.session_state.get("confirm_delete") == selected["id"]:
+                    try:
+                        delete_member(pg, selected["id"])
+                        st.session_state.pop("confirm_delete", None)
+                        st.success("Removed.")
                         st.rerun()
+                    except Exception as exc:
+                        st.error(f"Failed: {exc}")
+                else:
+                    st.session_state["confirm_delete"] = selected["id"]
+                    st.warning("Click Remove again to confirm.")
+
+    if open_member_actions:
+        show_selected_member_actions()
+
+    with communications_tab:
+        st.divider()
+        st.subheader("Email Reminders")
+
+        try:
+            smtp = load_smtp_settings(pg)
+            templates = load_email_templates(pg)
+        except Exception:
+            smtp = {
+                "host": "",
+                "port": 0,
+                "security": "SSL",
+                "username": "",
+                "password": "",
+                "from_addr": "",
+            }
+            templates = EMAIL_TEMPLATE_DEFAULTS
+
+        if not smtp["host"] or not smtp["port"] or not smtp["from_addr"] or not smtp["password"]:
+            st.info("Configure SMTP settings in Settings before scanning.")
+        else:
+            auto_ran, auto_state, auto_stats = maybe_run_automated_member_reminders(
+                pg,
+                smtp,
+                templates,
+                members,
+            )
+            automatic_emails_enabled = _bool_setting(
+                get_setting(pg, AUTOMATIC_MEMBER_EMAILS_ENABLED_KEY), False
+            )
+            auto_enabled = _bool_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_ENABLED_KEY), False)
+            auto_interval = max(5, _int_setting(get_setting(pg, EMAIL_REMINDERS_AUTO_INTERVAL_MIN_KEY), 60))
+            if automatic_emails_enabled and auto_enabled:
+                if auto_ran:
+                    if int(auto_stats.get("sent", 0)) > 0:
+                        st.success(
+                            f"Automated reminders sent {int(auto_stats.get('sent', 0))} email(s). "
+                            f"Skipped: {int(auto_stats.get('skipped_no_email', 0))}, Failed: {int(auto_stats.get('failed', 0))}."
+                        )
+                    elif int(auto_stats.get("pending", 0)) == 0:
+                        st.caption("Automated reminders checked: no reminders were due.")
+                elif auto_state == "throttled":
+                    mins_left = int(auto_stats.get("minutes_remaining", 0))
+                    st.caption(
+                        f"Automated reminders are enabled (every {auto_interval} min). "
+                        f"Next check in about {mins_left} min."
+                    )
+            elif not automatic_emails_enabled:
+                st.caption("Automatic member emails are disabled in Settings.")
+
+            pending = get_pending_reminders(members, templates)
+            deliverable_pending = [p for p in pending if parseaddr(str(p.get("email") or "").strip())[1].strip()]
+            skipped_missing_email = len(pending) - len(deliverable_pending)
+
+            if not deliverable_pending:
+                st.success("No reminders due today.")
+            else:
+                st.write(f"**{len(deliverable_pending)} reminder(s) ready to send:**")
+                if skipped_missing_email:
+                    st.caption(f"Skipped {skipped_missing_email} reminder(s) with no email address.")
+                for i, p in enumerate(deliverable_pending):
+                    with st.expander(f"{p['subject']} → {p['email']}"):
+                        subj = st.text_input("Subject", value=p["subject"], key=f"subj_{i}")
+                        body = st.text_area("Body", value=p["body"], key=f"body_{i}")
+                        c_send, c_skip = st.columns(2)
+                        if c_send.button("Send", key=f"send_{i}"):
+                            try:
+                                send_email(
+                                    smtp["host"],
+                                    int(smtp["port"]),
+                                    smtp["username"],
+                                    smtp["password"],
+                                    p["email"],
+                                    subj,
+                                    body,
+                                    security=smtp["security"],
+                                    from_addr=smtp["from_addr"],
+                                )
+                                pg.from_("members").update({"last_reminder": p["target"]}).eq(
+                                    "id", p["id"]
+                                ).execute()
+                                st.success("Sent.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Send failed: {exc}")
+                        if c_skip.button("Skip", key=f"skip_{i}"):
+                            st.rerun()
 
 
 # ── Page: Sales Ledger ────────────────────────────────────────────────────────
@@ -8426,34 +7758,185 @@ def page_sales_ledger(pg: SyncPostgrestClient):
 
 # ── Page: POS ──────────────────────────────────────────────────────────────────
 
+def load_schedule_employees(pg: SyncPostgrestClient) -> list[dict]:
+    return [
+        {"name": str(r.get("name") or "").strip(), "email": str(r.get("email") or "").strip()}
+        for r in _load_json_list_setting(pg, SCHEDULE_EMPLOYEES_KEY)
+        if str(r.get("name") or "").strip() or str(r.get("email") or "").strip()
+    ]
+
+
+def send_weekly_schedule_to_employees(pg: SyncPostgrestClient, smtp: dict) -> dict:
+    employees = [e for e in load_schedule_employees(pg) if "@" in e["email"]]
+    if not employees:
+        raise ValueError("Add at least one employee with an email address first.")
+    shifts = load_weekly_employee_shifts(pg)
+    lines = ["Here is the weekly employee schedule:", ""]
+    current_day = ""
+    for row in shifts:
+        if row["Day"] != current_day:
+            current_day = row["Day"]
+            lines.append(current_day)
+        lines.append(f"  {row['Shift']} ({row['Hours']}): {row['Employee'] or 'Unassigned'}")
+    body = "\n".join(lines)
+    sent = 0
+    failed: list[str] = []
+    for employee in employees:
+        try:
+            send_email(
+                smtp["host"],
+                int(smtp["port"]),
+                smtp.get("username", ""),
+                smtp.get("password", ""),
+                employee["email"],
+                "Liberty Smokes Weekly Employee Schedule",
+                body,
+                security=smtp.get("security", "SSL"),
+                from_addr=smtp.get("from_addr", ""),
+            )
+            sent += 1
+        except Exception:
+            failed.append(employee["email"])
+    if sent:
+        save_setting(pg, SCHEDULE_STAFF_LAST_SENT_KEY, datetime.date.today().isoformat())
+    return {"sent": sent, "failed": failed}
+
+
 def page_schedule(pg: SyncPostgrestClient):
     st.header("Schedule")
-    st.caption("Set recurring monthly reminders and track upcoming store events.")
+    st.caption("The recurring weekly shift schedule for your employees.")
 
     try:
-        monthly_reminders = load_monthly_schedule_reminders(pg)
+        weekly_shifts = load_weekly_employee_shifts(pg)
+        employees = load_schedule_employees(pg)
+        smtp_cfg = load_smtp_settings(pg)
+    except Exception as exc:
+        st.error(f"Failed to load schedule data: {exc}")
+        return
+
+    smtp_ready = all(smtp_cfg.get(k) for k in ("host", "port", "from_addr", "password"))
+    auto_enabled = _bool_setting(get_setting(pg, SCHEDULE_STAFF_AUTO_ENABLED_KEY), False)
+    days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    auto_day = str(get_setting(pg, SCHEDULE_STAFF_AUTO_DAY_KEY) or "Sunday")
+    if auto_day not in days:
+        auto_day = "Sunday"
+    last_sent = str(get_setting(pg, SCHEDULE_STAFF_LAST_SENT_KEY) or "").strip()
+
+    if auto_enabled and smtp_ready and employees:
+        today = datetime.date.today()
+        if today.strftime("%A") == auto_day and last_sent != today.isoformat():
+            try:
+                stats = send_weekly_schedule_to_employees(pg, smtp_cfg)
+                st.success(f"Weekly schedule auto-sent to {stats['sent']} employee(s).")
+                last_sent = today.isoformat()
+            except Exception as exc:
+                st.warning(f"Auto-send failed: {exc}")
+
+    m1, m2 = st.columns(2)
+    m1.metric("Shifts assigned", sum(bool(str(r.get("Employee") or "").strip()) for r in weekly_shifts))
+    m2.metric("Employees", len(employees))
+
+    st.subheader("Weekly Employee Shifts")
+    st.caption("This schedule repeats every week. Edit the hours or employee for each shift, then save.")
+    names = [e["name"] for e in employees if e["name"]]
+    options = [""] + names + sorted(
+        {str(r["Employee"]) for r in weekly_shifts if r["Employee"] and r["Employee"] not in names}
+    )
+    employee_column = (
+        st.column_config.SelectboxColumn("Employee", options=options, help="Choose the employee for this shift.")
+        if names
+        else st.column_config.TextColumn("Employee", help="Add employees below to pick from a list.")
+    )
+    edited_shifts = st.data_editor(
+        weekly_shifts,
+        key="weekly_employee_shifts_editor",
+        width="stretch",
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["Day", "Shift"],
+        column_config={
+            "Hours": st.column_config.TextColumn(
+                "Hours",
+                help="Edit the hours for this shift, e.g. 10:00 AM - 6:00 PM.",
+            ),
+            "Employee": employee_column,
+        },
+    )
+    if st.button("Save Weekly Schedule", type="primary", key="save_weekly_employee_shifts"):
+        try:
+            save_weekly_employee_shifts(pg, edited_shifts)
+            st.success("Weekly employee schedule saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Failed to save weekly employee schedule: {exc}")
+
+    st.divider()
+    st.subheader("Employees")
+    emp_df = pd.DataFrame(employees, columns=["name", "email"])
+    edited_emps = st.data_editor(
+        emp_df,
+        num_rows="dynamic",
+        width="stretch",
+        hide_index=True,
+        key="schedule_employees_editor",
+    )
+    if st.button("Save Employees", key="schedule_employees_save"):
+        cleaned: list[dict] = []
+        for _, row in edited_emps.iterrows():
+            name = str(row.get("name") or "").strip()
+            addr = parseaddr(str(row.get("email") or "").strip())[1].strip()
+            if name or addr:
+                cleaned.append({"name": name, "email": addr})
+        _save_json_list_setting(pg, SCHEDULE_EMPLOYEES_KEY, cleaned)
+        st.success(f"Saved {len(cleaned)} employee(s).")
+        st.rerun()
+
+    st.divider()
+    st.subheader("Email Schedule to Employees")
+    st.caption("Sends the full weekly schedule to every employee with an email address.")
+    a1, a2 = st.columns(2)
+    auto_on = a1.checkbox("Auto-send weekly", value=auto_enabled, key="schedule_staff_auto_enabled")
+    auto_day_pick = a2.selectbox(
+        "Send on", days, index=days.index(auto_day), key="schedule_staff_auto_day"
+    )
+    b1, b2 = st.columns(2)
+    if b1.button("Save Auto-Send Settings", key="schedule_staff_auto_save"):
+        save_setting(pg, SCHEDULE_STAFF_AUTO_ENABLED_KEY, "1" if auto_on else "0")
+        save_setting(pg, SCHEDULE_STAFF_AUTO_DAY_KEY, auto_day_pick)
+        st.success("Auto-send settings saved.")
+        st.rerun()
+    if b2.button("Email Schedule Now", key="schedule_staff_send_now"):
+        if not smtp_ready:
+            st.warning("Configure SMTP in Settings before sending.")
+        else:
+            try:
+                stats = send_weekly_schedule_to_employees(pg, smtp_cfg)
+                st.success(f"Schedule sent to {stats['sent']} employee(s).")
+                if stats["failed"]:
+                    st.warning(f"Failed for: {', '.join(stats['failed'])}")
+            except Exception as exc:
+                st.error(f"Failed to send schedule: {exc}")
+    st.caption(f"Last sent: {last_sent or 'never'}")
+
+
+def page_events(pg: SyncPostgrestClient):
+    st.header("Events")
+    st.caption("Track tastings, launches, and in-store events, and email them to members or your public list.")
+
+    try:
         store_events = load_store_events_schedule(pg)
     except Exception as exc:
         st.error(f"Failed to load schedule data: {exc}")
         return
 
     today = datetime.date.today()
-    due_soon = [
-        reminder
-        for reminder in monthly_reminders
-        if reminder.get("enabled")
-        and 0 <= (_next_monthly_due_date(int(reminder.get("day_of_month") or 1), today) - today).days <= 7
-    ]
     upcoming_events = [
         event
         for event in store_events
         if str(event.get("event_date") or "") >= today.strftime("%Y-%m-%d")
     ]
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Monthly reminders", len(monthly_reminders))
-    m2.metric("Due in next 7 days", len(due_soon))
-    m3.metric("Upcoming events", len(upcoming_events))
+    st.metric("Upcoming events", len(upcoming_events))
 
     st.divider()
     st.subheader("Schedule Email Digest")
@@ -8486,14 +7969,10 @@ def page_schedule(pg: SyncPostgrestClient):
         auto_ran, auto_state, auto_stats = maybe_run_automated_schedule_digest(
             pg,
             smtp_cfg,
-            monthly_reminders,
             store_events,
         )
         if auto_ran:
-            st.success(
-                "Auto schedule digest sent "
-                f"({int(auto_stats.get('due_count', 0))} due reminder(s), {int(auto_stats.get('events_count', 0))} event(s))."
-            )
+            st.success(f"Auto schedule digest sent ({int(auto_stats.get('events_count', 0))} event(s)).")
         elif auto_state == "throttled":
             mins_left = int(auto_stats.get("minutes_remaining", 0))
             st.caption(f"Auto digest throttled. Next run in about {mins_left} min.")
@@ -8504,15 +7983,26 @@ def page_schedule(pg: SyncPostgrestClient):
 
     s1, s2 = st.columns(2)
     digest_to_input = s1.text_input(
-        "Digest recipient email",
+        "Extra recipient email(s)",
         value=schedule_to or str(smtp_cfg.get("from_addr") or smtp_cfg.get("username") or ""),
         key="schedule_digest_to",
-        help="Where schedule summary emails are delivered.",
+        help="One or more addresses separated by commas.",
     )
     digest_auto_enabled = s2.checkbox(
         "Enable auto digest",
         value=auto_enabled,
         key="schedule_digest_auto_enabled",
+    )
+    r1, r2 = st.columns(2)
+    digest_members = r1.checkbox(
+        "Send to all active members",
+        value=_bool_setting(get_setting(pg, SCHEDULE_EMAIL_MEMBERS_KEY), False),
+        key="schedule_digest_members",
+    )
+    digest_list = r2.checkbox(
+        "Send to public mailing list",
+        value=_bool_setting(get_setting(pg, SCHEDULE_EMAIL_LIST_KEY), False),
+        key="schedule_digest_list",
     )
     digest_interval = st.number_input(
         "Auto digest interval (minutes)",
@@ -8524,10 +8014,39 @@ def page_schedule(pg: SyncPostgrestClient):
         help="Use 1440 for daily digest delivery.",
     )
 
+    with st.expander("Public Mailing List (non-members)", expanded=False):
+        st.caption("People who aren't members but want to hear about public events.")
+        list_rows = _load_json_list_setting(pg, PUBLIC_MAILING_LIST_KEY)
+        list_df = pd.DataFrame(
+            [{"name": str(r.get("name") or ""), "email": str(r.get("email") or "")} for r in list_rows],
+            columns=["name", "email"],
+        )
+        edited_list = st.data_editor(
+            list_df,
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key="public_mailing_list_editor",
+        )
+        if st.button("Save Mailing List", key="public_mailing_list_save"):
+            cleaned: list[dict] = []
+            seen_emails: set[str] = set()
+            for _, row in edited_list.iterrows():
+                addr = parseaddr(str(row.get("email") or "").strip())[1].strip()
+                if "@" not in addr or addr.lower() in seen_emails:
+                    continue
+                seen_emails.add(addr.lower())
+                cleaned.append({"name": str(row.get("name") or "").strip(), "email": addr})
+            _save_json_list_setting(pg, PUBLIC_MAILING_LIST_KEY, cleaned)
+            st.success(f"Saved {len(cleaned)} address(es).")
+            st.rerun()
+
     b1, b2 = st.columns(2)
     if b1.button("Save Digest Settings", key="schedule_digest_save"):
         try:
             save_setting(pg, SCHEDULE_EMAIL_TO_KEY, digest_to_input.strip())
+            save_setting(pg, SCHEDULE_EMAIL_MEMBERS_KEY, "1" if digest_members else "0")
+            save_setting(pg, SCHEDULE_EMAIL_LIST_KEY, "1" if digest_list else "0")
             save_setting(pg, SCHEDULE_EMAIL_AUTO_ENABLED_KEY, "1" if digest_auto_enabled else "0")
             save_setting(pg, SCHEDULE_EMAIL_AUTO_INTERVAL_MIN_KEY, str(int(digest_interval)))
             st.success("Schedule digest settings saved.")
@@ -8536,17 +8055,16 @@ def page_schedule(pg: SyncPostgrestClient):
             st.error(f"Failed to save digest settings: {exc}")
 
     if b2.button("Send Digest Now", key="schedule_digest_send_now"):
-        recipient_now = digest_to_input.strip() or str(smtp_cfg.get("from_addr") or "")
+        recipients_now = resolve_digest_recipients(pg, digest_to_input, digest_members, digest_list)
         if not smtp_ready:
             st.warning("Configure SMTP in Settings before sending digest emails.")
-        elif not recipient_now:
-            st.warning("Recipient email is required.")
+        elif not recipients_now:
+            st.warning("Add a recipient, or tick members / mailing list.")
         else:
             try:
                 stats = send_schedule_digest_email(
                     smtp_cfg,
-                    recipient_now,
-                    monthly_reminders,
+                    recipients_now,
                     store_events,
                     lookahead_days=31,
                 )
@@ -8557,13 +8075,15 @@ def page_schedule(pg: SyncPostgrestClient):
                     SCHEDULE_EMAIL_AUTO_LAST_RESULT_KEY,
                     (
                         f"sent={stats.get('sent', 0)}; recipient={stats.get('recipient', '')}; "
-                        f"due={stats.get('due_count', 0)}; events={stats.get('events_count', 0)}"
+                        f"events={stats.get('events_count', 0)}"
                     ),
                 )
                 st.success(
-                    f"Digest sent to {stats.get('recipient', '')}. "
-                    f"Included {int(stats.get('due_count', 0))} due reminder(s) and {int(stats.get('events_count', 0))} event(s)."
+                    f"Digest sent to {int(stats.get('sent', 0))} recipient(s). "
+                    f"Included {int(stats.get('events_count', 0))} event(s)."
                 )
+                if stats.get("failed"):
+                    st.warning(f"Failed for: {', '.join(stats['failed'][:10])}")
             except Exception as exc:
                 st.error(f"Failed to send digest: {exc}")
 
@@ -8571,268 +8091,197 @@ def page_schedule(pg: SyncPostgrestClient):
     if auto_last_result:
         st.caption(f"Last digest result: {auto_last_result}")
 
-    tab_monthly, tab_events = st.tabs(["Monthly Reminders", "Store Events"])
 
-    with tab_monthly:
-        st.subheader("Monthly Filing Reminders")
-        st.caption("Great for sales tax filings and other monthly tasks.")
+    st.subheader("Store Events")
+    st.caption("Track tastings, launches, and in-store events.")
 
-        with st.form("schedule_add_monthly_reminder"):
-            c1, c2, c3 = st.columns([2, 1, 1])
-            reminder_title = c1.text_input("Reminder title", value="Monthly Sales Tax Filing")
-            reminder_day = c2.number_input("Day of month", min_value=1, max_value=31, value=1, step=1)
-            reminder_enabled = c3.checkbox("Enabled", value=True)
-            reminder_notes = st.text_area("Notes (optional)", height=90)
-            add_monthly_clicked = st.form_submit_button("Add Reminder", type="primary")
+    e1, e2, e3 = st.columns([2, 1, 1])
+    event_title = e1.text_input("Event title", key="schedule_event_title")
+    event_date = e2.date_input("Date", value=today, key="schedule_event_date")
+    event_all_day = e3.checkbox("All day", value=True, key="schedule_event_all_day")
+    if event_all_day:
+        event_hour = 6
+        event_minute = 0
+        event_period = "PM"
+        st.caption("All-day event: no start time required.")
+    else:
+        t1, t2, t3 = st.columns([1, 1, 1])
+        event_hour = t1.selectbox("Hour", list(range(1, 13)), index=5, key="schedule_event_hour")
+        event_minute = t2.selectbox(
+            "Minute",
+            list(range(0, 60)),
+            index=0,
+            format_func=lambda value: f"{value:02d}",
+            key="schedule_event_minute",
+        )
+        event_period = t3.selectbox("AM/PM", ["AM", "PM"], index=1, key="schedule_event_period")
+    event_location = st.text_input("Location (optional)", key="schedule_event_location")
+    event_notes = st.text_area("Notes (optional)", height=100, key="schedule_event_notes")
+    add_event_clicked = st.button("Add Event", type="primary", key="schedule_add_event_btn")
 
-        if add_monthly_clicked:
-            clean_title = reminder_title.strip()
-            if not clean_title:
-                st.warning("Reminder title is required.")
-            else:
-                new_row = {
-                    "id": hashlib.sha1(
-                        f"{clean_title.lower()}|{int(reminder_day)}|{datetime.datetime.now().isoformat()}".encode("utf-8")
-                    ).hexdigest()[:12],
-                    "title": clean_title,
-                    "day_of_month": int(reminder_day),
-                    "notes": reminder_notes.strip(),
-                    "enabled": bool(reminder_enabled),
-                }
-                monthly_reminders.append(new_row)
-                save_monthly_schedule_reminders(pg, monthly_reminders)
-                st.success("Monthly reminder saved.")
-                st.rerun()
-
-        if not monthly_reminders:
-            st.info("No monthly reminders yet.")
+    if add_event_clicked:
+        clean_title = event_title.strip()
+        if not clean_title:
+            st.warning("Event title is required.")
         else:
-            for reminder in monthly_reminders:
-                reminder_id = str(reminder.get("id") or "")
-                next_due = _next_monthly_due_date(int(reminder.get("day_of_month") or 1), today)
-                days_left = (next_due - today).days
-                status_label = "Enabled" if reminder.get("enabled") else "Disabled"
-
-                c1, c2, c3 = st.columns([3, 1, 1])
-                c1.markdown(
-                    f"**{reminder.get('title', '')}**  \n"
-                    f"Day {int(reminder.get('day_of_month') or 1)} each month | {status_label} | "
-                    f"Next due: {next_due.strftime('%Y-%m-%d')} ({days_left} day(s))"
-                )
-                if c2.button(
-                    "Disable" if reminder.get("enabled") else "Enable",
-                    key=f"schedule_toggle_monthly_{reminder_id}",
-                ):
-                    updated = []
-                    for row in monthly_reminders:
-                        if str(row.get("id") or "") == reminder_id:
-                            changed = dict(row)
-                            changed["enabled"] = not bool(row.get("enabled"))
-                            updated.append(changed)
-                        else:
-                            updated.append(row)
-                    save_monthly_schedule_reminders(pg, updated)
-                    st.rerun()
-                if c3.button("Delete", key=f"schedule_delete_monthly_{reminder_id}"):
-                    updated = [
-                        row for row in monthly_reminders if str(row.get("id") or "") != reminder_id
-                    ]
-                    save_monthly_schedule_reminders(pg, updated)
-                    st.rerun()
-                if str(reminder.get("notes") or "").strip():
-                    st.caption(str(reminder.get("notes") or "").strip())
-                st.divider()
-
-    with tab_events:
-        st.subheader("Store Events")
-        st.caption("Track tastings, launches, and in-store events.")
-
-        e1, e2, e3 = st.columns([2, 1, 1])
-        event_title = e1.text_input("Event title", key="schedule_event_title")
-        event_date = e2.date_input("Date", value=today, key="schedule_event_date")
-        event_all_day = e3.checkbox("All day", value=True, key="schedule_event_all_day")
-        if event_all_day:
-            event_hour = 6
-            event_minute = 0
-            event_period = "PM"
-            st.caption("All-day event: no start time required.")
-        else:
-            t1, t2, t3 = st.columns([1, 1, 1])
-            event_hour = t1.selectbox("Hour", list(range(1, 13)), index=5, key="schedule_event_hour")
-            event_minute = t2.selectbox(
-                "Minute",
-                list(range(0, 60)),
-                index=0,
-                format_func=lambda value: f"{value:02d}",
-                key="schedule_event_minute",
+            event_date_text = event_date.strftime("%Y-%m-%d")
+            start_time = "" if event_all_day else _time_parts_to_24h(event_hour, event_minute, event_period)
+            new_event = {
+                "id": hashlib.sha1(
+                    f"{clean_title.lower()}|{event_date_text}|{start_time}|{datetime.datetime.now().isoformat()}".encode("utf-8")
+                ).hexdigest()[:12],
+                "title": clean_title,
+                "event_date": event_date_text,
+                "all_day": bool(event_all_day),
+                "start_time": start_time,
+                "location": event_location.strip(),
+                "notes": event_notes.strip(),
+            }
+            store_events.append(new_event)
+            save_store_events_schedule(pg, store_events)
+            st.success("Event saved.")
+            queue_widget_reset(
+                {
+                    "schedule_event_title": "",
+                    "schedule_event_date": today,
+                    "schedule_event_all_day": True,
+                    "schedule_event_hour": 6,
+                    "schedule_event_minute": 0,
+                    "schedule_event_period": "PM",
+                    "schedule_event_location": "",
+                    "schedule_event_notes": "",
+                },
+                GLOBAL_PENDING_WIDGET_RESET_KEY,
             )
-            event_period = t3.selectbox("AM/PM", ["AM", "PM"], index=1, key="schedule_event_period")
-        event_location = st.text_input("Location (optional)", key="schedule_event_location")
-        event_notes = st.text_area("Notes (optional)", height=100, key="schedule_event_notes")
-        add_event_clicked = st.button("Add Event", type="primary", key="schedule_add_event_btn")
+            st.rerun()
 
-        if add_event_clicked:
-            clean_title = event_title.strip()
-            if not clean_title:
-                st.warning("Event title is required.")
+    show_past = st.checkbox("Show past events", value=False, key="schedule_show_past_events")
+    visible_events = []
+    for event in store_events:
+        event_date_text = str(event.get("event_date") or "")
+        if show_past or event_date_text >= today.strftime("%Y-%m-%d"):
+            visible_events.append(event)
+
+    if not visible_events:
+        st.info("No events to show.")
+    else:
+        for event in visible_events:
+            event_id = str(event.get("id") or "")
+            date_text = str(event.get("event_date") or "")
+            when_text = date_text
+            if not bool(event.get("all_day")) and str(event.get("start_time") or "").strip():
+                when_text = f"{date_text} at {_format_time_12h(str(event.get('start_time') or '').strip())}"
+
+            c1, c2 = st.columns([4, 1])
+            title = str(event.get("title") or "")
+            location = str(event.get("location") or "").strip()
+            if location:
+                c1.markdown(f"**{title}**  \n{when_text} | {location}")
             else:
-                event_date_text = event_date.strftime("%Y-%m-%d")
-                start_time = "" if event_all_day else _time_parts_to_24h(event_hour, event_minute, event_period)
-                new_event = {
-                    "id": hashlib.sha1(
-                        f"{clean_title.lower()}|{event_date_text}|{start_time}|{datetime.datetime.now().isoformat()}".encode("utf-8")
-                    ).hexdigest()[:12],
-                    "title": clean_title,
-                    "event_date": event_date_text,
-                    "all_day": bool(event_all_day),
-                    "start_time": start_time,
-                    "location": event_location.strip(),
-                    "notes": event_notes.strip(),
-                }
-                store_events.append(new_event)
-                save_store_events_schedule(pg, store_events)
-                st.success("Event saved.")
-                queue_widget_reset(
-                    {
-                        "schedule_event_title": "",
-                        "schedule_event_date": today,
-                        "schedule_event_all_day": True,
-                        "schedule_event_hour": 6,
-                        "schedule_event_minute": 0,
-                        "schedule_event_period": "PM",
-                        "schedule_event_location": "",
-                        "schedule_event_notes": "",
-                    },
-                    GLOBAL_PENDING_WIDGET_RESET_KEY,
-                )
+                c1.markdown(f"**{title}**  \n{when_text}")
+
+            if c2.button("Delete", key=f"schedule_delete_event_{event_id}"):
+                updated = [
+                    row for row in store_events if str(row.get("id") or "") != event_id
+                ]
+                save_store_events_schedule(pg, updated)
                 st.rerun()
 
-        show_past = st.checkbox("Show past events", value=False, key="schedule_show_past_events")
-        visible_events = []
-        for event in store_events:
-            event_date_text = str(event.get("event_date") or "")
-            if show_past or event_date_text >= today.strftime("%Y-%m-%d"):
-                visible_events.append(event)
+            with st.expander("Edit event", expanded=False):
+                try:
+                    default_edit_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
+                except Exception:
+                    default_edit_date = today
+                edit_all_day_default = bool(event.get("all_day"))
+                default_hour, default_minute, default_period = _time_24h_to_parts(
+                    str(event.get("start_time") or "18:00").strip() or "18:00",
+                    default_hour=6,
+                    default_minute=0,
+                    default_period="PM",
+                )
 
-        if not visible_events:
-            st.info("No events to show.")
-        else:
-            for event in visible_events:
-                event_id = str(event.get("id") or "")
-                date_text = str(event.get("event_date") or "")
-                when_text = date_text
-                if not bool(event.get("all_day")) and str(event.get("start_time") or "").strip():
-                    when_text = f"{date_text} at {_format_time_12h(str(event.get('start_time') or '').strip())}"
-
-                c1, c2 = st.columns([4, 1])
-                title = str(event.get("title") or "")
-                location = str(event.get("location") or "").strip()
-                if location:
-                    c1.markdown(f"**{title}**  \n{when_text} | {location}")
+                ec1, ec2, ec3 = st.columns([2, 1, 1])
+                edit_title = ec1.text_input(
+                    "Title",
+                    value=title,
+                    key=f"schedule_edit_title_{event_id}",
+                )
+                edit_date = ec2.date_input(
+                    "Date",
+                    value=default_edit_date,
+                    key=f"schedule_edit_date_{event_id}",
+                )
+                edit_all_day = ec3.checkbox(
+                    "All day",
+                    value=edit_all_day_default,
+                    key=f"schedule_edit_all_day_{event_id}",
+                )
+                if edit_all_day:
+                    edit_hour = default_hour
+                    edit_minute = default_minute
+                    edit_period = default_period
+                    st.caption("All-day event: no start time required.")
                 else:
-                    c1.markdown(f"**{title}**  \n{when_text}")
-
-                if c2.button("Delete", key=f"schedule_delete_event_{event_id}"):
-                    updated = [
-                        row for row in store_events if str(row.get("id") or "") != event_id
-                    ]
-                    save_store_events_schedule(pg, updated)
-                    st.rerun()
-
-                with st.expander("Edit event", expanded=False):
-                    try:
-                        default_edit_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
-                    except Exception:
-                        default_edit_date = today
-                    edit_all_day_default = bool(event.get("all_day"))
-                    default_hour, default_minute, default_period = _time_24h_to_parts(
-                        str(event.get("start_time") or "18:00").strip() or "18:00",
-                        default_hour=6,
-                        default_minute=0,
-                        default_period="PM",
+                    et1, et2, et3 = st.columns([1, 1, 1])
+                    edit_hour = et1.selectbox(
+                        "Hour",
+                        list(range(1, 13)),
+                        index=max(0, min(11, default_hour - 1)),
+                        key=f"schedule_edit_hour_{event_id}",
                     )
-
-                    ec1, ec2, ec3 = st.columns([2, 1, 1])
-                    edit_title = ec1.text_input(
-                        "Title",
-                        value=title,
-                        key=f"schedule_edit_title_{event_id}",
+                    edit_minute = et2.selectbox(
+                        "Minute",
+                        list(range(0, 60)),
+                        index=max(0, min(59, default_minute)),
+                        format_func=lambda value: f"{value:02d}",
+                        key=f"schedule_edit_minute_{event_id}",
                     )
-                    edit_date = ec2.date_input(
-                        "Date",
-                        value=default_edit_date,
-                        key=f"schedule_edit_date_{event_id}",
+                    edit_period = et3.selectbox(
+                        "AM/PM",
+                        ["AM", "PM"],
+                        index=0 if default_period == "AM" else 1,
+                        key=f"schedule_edit_period_{event_id}",
                     )
-                    edit_all_day = ec3.checkbox(
-                        "All day",
-                        value=edit_all_day_default,
-                        key=f"schedule_edit_all_day_{event_id}",
-                    )
-                    if edit_all_day:
-                        edit_hour = default_hour
-                        edit_minute = default_minute
-                        edit_period = default_period
-                        st.caption("All-day event: no start time required.")
+                edit_location = st.text_input(
+                    "Location",
+                    value=location,
+                    key=f"schedule_edit_location_{event_id}",
+                )
+                edit_notes = st.text_area(
+                    "Notes",
+                    value=str(event.get("notes") or ""),
+                    height=100,
+                    key=f"schedule_edit_notes_{event_id}",
+                )
+                if st.button("Save Changes", key=f"schedule_save_event_{event_id}"):
+                    clean_edit_title = edit_title.strip()
+                    if not clean_edit_title:
+                        st.warning("Event title is required.")
                     else:
-                        et1, et2, et3 = st.columns([1, 1, 1])
-                        edit_hour = et1.selectbox(
-                            "Hour",
-                            list(range(1, 13)),
-                            index=max(0, min(11, default_hour - 1)),
-                            key=f"schedule_edit_hour_{event_id}",
-                        )
-                        edit_minute = et2.selectbox(
-                            "Minute",
-                            list(range(0, 60)),
-                            index=max(0, min(59, default_minute)),
-                            format_func=lambda value: f"{value:02d}",
-                            key=f"schedule_edit_minute_{event_id}",
-                        )
-                        edit_period = et3.selectbox(
-                            "AM/PM",
-                            ["AM", "PM"],
-                            index=0 if default_period == "AM" else 1,
-                            key=f"schedule_edit_period_{event_id}",
-                        )
-                    edit_location = st.text_input(
-                        "Location",
-                        value=location,
-                        key=f"schedule_edit_location_{event_id}",
-                    )
-                    edit_notes = st.text_area(
-                        "Notes",
-                        value=str(event.get("notes") or ""),
-                        height=100,
-                        key=f"schedule_edit_notes_{event_id}",
-                    )
-                    if st.button("Save Changes", key=f"schedule_save_event_{event_id}"):
-                        clean_edit_title = edit_title.strip()
-                        if not clean_edit_title:
-                            st.warning("Event title is required.")
-                        else:
-                            updated = []
-                            for row in store_events:
-                                if str(row.get("id") or "") == event_id:
-                                    updated.append(
-                                        {
-                                            "id": event_id,
-                                            "title": clean_edit_title,
-                                            "event_date": edit_date.strftime("%Y-%m-%d"),
-                                            "all_day": bool(edit_all_day),
-                                            "start_time": "" if edit_all_day else _time_parts_to_24h(edit_hour, edit_minute, edit_period),
-                                            "location": edit_location.strip(),
-                                            "notes": edit_notes.strip(),
-                                        }
-                                    )
-                                else:
-                                    updated.append(row)
-                            save_store_events_schedule(pg, updated)
-                            st.success("Event updated.")
-                            st.rerun()
+                        updated = []
+                        for row in store_events:
+                            if str(row.get("id") or "") == event_id:
+                                updated.append(
+                                    {
+                                        "id": event_id,
+                                        "title": clean_edit_title,
+                                        "event_date": edit_date.strftime("%Y-%m-%d"),
+                                        "all_day": bool(edit_all_day),
+                                        "start_time": "" if edit_all_day else _time_parts_to_24h(edit_hour, edit_minute, edit_period),
+                                        "location": edit_location.strip(),
+                                        "notes": edit_notes.strip(),
+                                    }
+                                )
+                            else:
+                                updated.append(row)
+                        save_store_events_schedule(pg, updated)
+                        st.success("Event updated.")
+                        st.rerun()
 
-                if str(event.get("notes") or "").strip():
-                    st.caption(str(event.get("notes") or "").strip())
-                st.divider()
+            if str(event.get("notes") or "").strip():
+                st.caption(str(event.get("notes") or "").strip())
+            st.divider()
+
 
 
 # ── Page: POS ──────────────────────────────────────────────────────────────────
@@ -9977,9 +9426,14 @@ def page_settings(pg: SyncPostgrestClient):
         )
         st.divider()
         st.caption("Sidebar navigation visibility. Settings always stays available.")
+        configurable_nav_pages = {
+            page_name: setting_key
+            for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items()
+            if page_name != "Seats"
+        }
         prev_nav_visibility = {
             page_name: _bool_setting(get_setting(pg, setting_key), True)
-            for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items()
+            for page_name, setting_key in configurable_nav_pages.items()
         }
         cfg_nav_visibility = {
             page_name: st.checkbox(
@@ -9987,204 +9441,12 @@ def page_settings(pg: SyncPostgrestClient):
                 value=prev_nav_visibility[page_name],
                 key=f"cfg_show_nav_{page_name.lower().replace(' ', '_')}",
             )
-            for page_name in NAV_PAGE_SETTING_KEYS
+            for page_name in configurable_nav_pages
         }
-        prev_show_member_margin = _bool_setting(get_setting(pg, MEMBER_MARGIN_SECTION_KEY), False)
-        prev_show_member_drink_tracker = _bool_setting(get_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY), False)
-        prev_show_member_mass_text = _bool_setting(get_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY), True)
-        cfg_show_member_margin = st.checkbox(
-            "Show Member Purchase Margins in Members page",
-            value=prev_show_member_margin,
-            key="cfg_show_member_margin",
-        )
-        cfg_show_member_drink_tracker = st.checkbox(
-            "Show Drink Tracker in Members page",
-            value=prev_show_member_drink_tracker,
-            key="cfg_show_member_drink_tracker",
-        )
-        cfg_show_member_mass_text = st.checkbox(
-            "Show Mass Text section in Members page",
-            value=prev_show_member_mass_text,
-            key="cfg_show_member_mass_text",
-        )
-        if (
-            cfg_nav_visibility != prev_nav_visibility
-            or cfg_show_member_margin != prev_show_member_margin
-            or cfg_show_member_drink_tracker != prev_show_member_drink_tracker
-            or cfg_show_member_mass_text != prev_show_member_mass_text
-        ):
-            for page_name, setting_key in NAV_PAGE_SETTING_KEYS.items():
+        if cfg_nav_visibility != prev_nav_visibility:
+            for page_name, setting_key in configurable_nav_pages.items():
                 save_setting(pg, setting_key, "1" if cfg_nav_visibility[page_name] else "0")
-            save_setting(pg, MEMBER_MARGIN_SECTION_KEY, "1" if cfg_show_member_margin else "0")
-            save_setting(pg, MEMBER_DRINK_TRACKER_SECTION_KEY, "1" if cfg_show_member_drink_tracker else "0")
-            save_setting(pg, MEMBER_MASS_TEXT_SECTION_KEY, "1" if cfg_show_member_mass_text else "0")
             st.rerun()
-
-    with st.expander("Drink Limits", expanded=True):
-        st.number_input(
-            "Member drink limit",
-            min_value=1, max_value=20,
-            value=st.session_state.get("drink_limit", 3),
-            step=1,
-            key="drink_limit",
-            help="Applied when the seated customer name matches a member on the Members page.",
-        )
-        st.number_input(
-            "Non-member drink limit",
-            min_value=1, max_value=20,
-            value=st.session_state.get("non_member_limit", 1),
-            step=1,
-            key="non_member_limit",
-            help="Applied when the seated customer is not found in the members list.",
-        )
-
-    with st.expander("Drink Catalog", expanded=True):
-        st.caption("Add drinks with cost and alcohol category. Seats will use this list for per-chair tracking.")
-        try:
-            drink_catalog = load_drink_catalog(pg)
-        except Exception:
-            drink_catalog = []
-
-        dc1, dc2, dc3 = st.columns(3)
-        new_drink_name = dc1.text_input("Drink name", key="cfg_drink_name")
-        new_drink_category = dc2.selectbox(
-            "Category",
-            ["alcoholic", "non_alcoholic"],
-            format_func=lambda x: "Alcoholic" if x == "alcoholic" else "Non-Alcoholic",
-            key="cfg_drink_category",
-        )
-        new_drink_cost = dc3.number_input(
-            "Cost",
-            min_value=0.0,
-            max_value=1000.0,
-            value=0.0,
-            step=0.25,
-            key="cfg_drink_cost",
-        )
-
-        if st.button("Add Drink", key="cfg_add_drink"):
-            clean_name = new_drink_name.strip()
-            if not clean_name:
-                st.warning("Enter a drink name.")
-            else:
-                exists = False
-                for item in drink_catalog:
-                    if str(item.get("name", "")).strip().lower() == clean_name.lower():
-                        exists = True
-                        break
-                if exists:
-                    st.warning("That drink already exists. Remove it first if you need to replace it.")
-                else:
-                    drink_catalog.append(
-                        {
-                            "id": hashlib.sha1(
-                                f"{clean_name.lower()}|{new_drink_category}|{datetime.datetime.now().isoformat()}".encode("utf-8")
-                            ).hexdigest()[:12],
-                            "name": clean_name,
-                            "category": new_drink_category,
-                            "cost": round(float(new_drink_cost or 0.0), 2),
-                        }
-                    )
-                    save_drink_catalog(pg, drink_catalog)
-                    st.success(f"Added {clean_name}.")
-                    st.rerun()
-
-        if drink_catalog:
-            catalog_rows = []
-            for item in drink_catalog:
-                catalog_rows.append(
-                    {
-                        "Name": item.get("name", ""),
-                        "Category": "Alcoholic" if item.get("category") == "alcoholic" else "Non-Alcoholic",
-                        "Cost": float(item.get("cost") or 0.0),
-                    }
-                )
-            st.dataframe(catalog_rows, width="stretch", hide_index=True)
-
-            editable = {
-                f"{item.get('name', '')} ({'Alcoholic' if item.get('category') == 'alcoholic' else 'Non-Alcoholic'})": item
-                for item in drink_catalog
-            }
-            edit_pick = st.selectbox(
-                "Edit drink",
-                list(editable.keys()),
-                key="cfg_edit_drink_pick",
-            )
-            edit_selected = editable[edit_pick]
-
-            ec1, ec2, ec3 = st.columns(3)
-            edit_name = ec1.text_input(
-                "Edit name",
-                value=str(edit_selected.get("name") or ""),
-                key=f"cfg_edit_name_{edit_selected.get('id')}",
-            )
-            edit_category = ec2.selectbox(
-                "Edit category",
-                ["alcoholic", "non_alcoholic"],
-                index=0 if str(edit_selected.get("category") or "") == "alcoholic" else 1,
-                format_func=lambda x: "Alcoholic" if x == "alcoholic" else "Non-Alcoholic",
-                key=f"cfg_edit_category_{edit_selected.get('id')}",
-            )
-            edit_cost = ec3.number_input(
-                "Edit cost",
-                min_value=0.0,
-                max_value=1000.0,
-                value=float(edit_selected.get("cost") or 0.0),
-                step=0.25,
-                key=f"cfg_edit_cost_{edit_selected.get('id')}",
-            )
-
-            if st.button("Save Drink Changes", key="cfg_save_drink_btn"):
-                clean_name = edit_name.strip()
-                if not clean_name:
-                    st.warning("Drink name cannot be blank.")
-                else:
-                    exists = False
-                    for item in drink_catalog:
-                        if str(item.get("id")) == str(edit_selected.get("id")):
-                            continue
-                        if str(item.get("name", "")).strip().lower() == clean_name.lower():
-                            exists = True
-                            break
-                    if exists:
-                        st.warning("Another drink already uses that name.")
-                    else:
-                        updated = []
-                        for item in drink_catalog:
-                            if str(item.get("id")) == str(edit_selected.get("id")):
-                                row = dict(item)
-                                row["name"] = clean_name
-                                row["category"] = edit_category
-                                row["cost"] = round(float(edit_cost or 0.0), 2)
-                                updated.append(row)
-                            else:
-                                updated.append(item)
-                        save_drink_catalog(pg, updated)
-                        st.success("Drink updated.")
-                        st.rerun()
-
-            st.divider()
-
-            removable = {
-                f"{item.get('name', '')} ({'Alcoholic' if item.get('category') == 'alcoholic' else 'Non-Alcoholic'})": item
-                for item in drink_catalog
-            }
-            remove_pick = st.selectbox(
-                "Remove drink",
-                list(removable.keys()),
-                key="cfg_remove_drink_pick",
-            )
-            if st.button("Remove Selected Drink", key="cfg_remove_drink_btn"):
-                selected = removable[remove_pick]
-                remaining = [
-                    item for item in drink_catalog
-                    if str(item.get("id")) != str(selected.get("id"))
-                ]
-                save_drink_catalog(pg, remaining)
-                st.success("Drink removed.")
-                st.rerun()
-        else:
-            st.info("No drinks configured yet.")
 
     with st.expander("Email Config (SMTP)", expanded=True):
         try:
@@ -10412,6 +9674,37 @@ def page_settings(pg: SyncPostgrestClient):
             except Exception as exc:
                 st.error(f"Failed: {exc}")
 
+    with st.expander("Inbox Email Config (IMAP)", expanded=False):
+        st.caption("Lets the Inbox page read replies from your sales reps. For Gmail, use imap.gmail.com and an app password.")
+        inbox_settings = load_ordering_imap_settings(pg)
+        imap_col1, imap_col2 = st.columns(2)
+        imap_host = imap_col1.text_input("IMAP server", value=inbox_settings["host"], key="cfg_imap_host")
+        imap_port = imap_col2.number_input(
+            "IMAP port", min_value=1, max_value=65535, value=int(inbox_settings["port"]), key="cfg_imap_port"
+        )
+        imap_username = st.text_input("Inbox email address", value=inbox_settings["username"], key="cfg_imap_user")
+        imap_password = st.text_input(
+            "Inbox password or app password",
+            type="password",
+            key="cfg_imap_pw",
+            help="Leave blank to keep the saved password.",
+        )
+        imap_security = st.selectbox(
+            "Connection security",
+            ["SSL", "STARTTLS"],
+            index=0 if inbox_settings["security"] == "SSL" else 1,
+            key="cfg_imap_security",
+        )
+        if st.button("Save Inbox Settings", key="cfg_imap_save"):
+            save_setting(pg, "ordering_imap_host", imap_host.strip())
+            save_setting(pg, "ordering_imap_port", str(int(imap_port)))
+            save_setting(pg, "ordering_imap_security", imap_security)
+            save_setting(pg, "ordering_imap_username", imap_username.strip())
+            if imap_password.strip():
+                save_setting(pg, "ordering_imap_password", imap_password.strip())
+            st.session_state["inbox_nonce"] = int(st.session_state.get("inbox_nonce", 0)) + 1
+            st.success("Inbox settings saved.")
+
     with st.expander("Email Templates", expanded=False):
         st.caption(
             "Available placeholders: {first_name}, {last_name}, {full_name}, {tier}, "
@@ -10571,87 +9864,6 @@ def page_settings(pg: SyncPostgrestClient):
         st.caption(f"Last run: {_format_datetime_12h(auto_last_run) or 'never'}")
         if auto_last_result:
             st.caption(f"Last result: {auto_last_result}")
-
-    with st.expander("SMS Config (Twilio)", expanded=False):
-        try:
-            sms = load_sms_settings(pg)
-        except Exception:
-            sms = {
-                "provider": "twilio",
-                "account_sid": "",
-                "auth_token": "",
-                "from_number": "",
-                "default_country_code": "+1",
-            }
-
-        st.caption("Set up Twilio to send text messages from the Members page.")
-        sid = st.text_input("Twilio Account SID", value=sms["account_sid"], key="cfg_sms_sid")
-        token = st.text_input("Twilio Auth Token", type="password", key="cfg_sms_token")
-        from_number = st.text_input(
-            "Twilio From Number (E.164)",
-            value=sms["from_number"],
-            key="cfg_sms_from",
-            help="Example: +16135551234",
-        )
-        default_cc = st.text_input(
-            "Default country code",
-            value=sms.get("default_country_code", "+1"),
-            key="cfg_sms_default_cc",
-            help="Used to normalize 10-digit phone numbers.",
-        )
-
-        s1, s2 = st.columns(2)
-        if s1.button("Save / Update SMS Config"):
-            try:
-                save_setting(pg, "sms_provider", "twilio")
-                save_setting(pg, "twilio_account_sid", sid.strip())
-                save_setting(pg, "twilio_from_number", from_number.strip())
-                save_setting(pg, "sms_default_country_code", (default_cc.strip() or "+1"))
-                if token.strip():
-                    save_setting(pg, "twilio_auth_token", encrypt_secret(token.strip()))
-                st.success("SMS settings saved.")
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
-
-        st.divider()
-        test_to = st.text_input("Test phone", key="cfg_sms_test_to", help="Example: +16135559876")
-        if st.button("Send Test Text"):
-            account_sid = sid.strip() or sms["account_sid"]
-            auth_token = token.strip() or sms["auth_token"]
-            sender = from_number.strip() or sms["from_number"]
-            country = (default_cc.strip() or sms.get("default_country_code", "+1"))
-            recipient = _phone_to_e164(test_to.strip(), country)
-
-            if not account_sid or not auth_token or not sender or not recipient:
-                st.warning("Set account SID, auth token, from number, and valid test phone before sending.")
-            else:
-                try:
-                    send_sms_twilio(
-                        account_sid,
-                        auth_token,
-                        sender,
-                        recipient,
-                        "Liberty Smokes SMS test from your dashboard.",
-                    )
-                    st.success(f"Test text sent to {recipient}.")
-                except Exception as exc:
-                    st.error(f"Test failed: {exc}")
-
-        if s2.button("Clear Saved SMS Config"):
-            try:
-                clear_setting(pg, "sms_provider")
-                clear_setting(pg, "twilio_account_sid")
-                clear_setting(pg, "twilio_auth_token")
-                clear_setting(pg, "twilio_from_number")
-                clear_setting(pg, "sms_default_country_code")
-                st.session_state["cfg_sms_sid"] = ""
-                st.session_state["cfg_sms_token"] = ""
-                st.session_state["cfg_sms_from"] = ""
-                st.session_state["cfg_sms_default_cc"] = "+1"
-                st.success("SMS settings cleared.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
 
     with st.expander("CigarPOS Integration", expanded=False):
         cfg = load_cigarpos_settings(pg)
@@ -10841,6 +10053,16 @@ def main():
     if st.session_state.get("nav_page") not in nav_pages:
         st.session_state["nav_page"] = query_page if query_page in nav_pages else nav_pages[0]
 
+    unread_count = 0
+    if "Inbox" in nav_pages:
+        inbox_messages, inbox_error = get_rep_inbox(pg, wait=False)
+        if not inbox_error:
+            read_ids = load_inbox_read_ids(pg)
+            unread_count = sum(1 for m in inbox_messages if m["uid"] not in read_ids)
+            if unread_count > int(st.session_state.get("inbox_notified_count", 0)):
+                st.toast(f"{unread_count} unread email(s) from sales reps", icon="📬")
+            st.session_state["inbox_notified_count"] = unread_count
+
     with st.sidebar:
         logo_path = get_sidebar_logo_path()
         if logo_path is not None:
@@ -10850,6 +10072,7 @@ def main():
             nav_pages,
             key="nav_page",
             label_visibility="collapsed",
+            format_func=lambda name: f"Inbox ({unread_count})" if name == "Inbox" and unread_count else name,
         )
         if "page" in st.query_params:
             del st.query_params["page"]
@@ -10860,14 +10083,16 @@ def main():
         page_seats(pg)
     elif page == "Members":
         page_members(pg)
-    elif page == "Campaigns":
-        page_communications(pg)
     elif page == "Sales Ledger":
         page_sales_ledger(pg)
     elif page == "Schedule":
         page_schedule(pg)
+    elif page == "Events":
+        page_events(pg)
     elif page == "Ordering":
         page_ordering(pg)
+    elif page == "Inbox":
+        page_inbox(pg)
     elif page == "POS":
         page_pos(pg)
     elif page == "Scanner":

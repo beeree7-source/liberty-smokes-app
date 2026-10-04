@@ -45,7 +45,7 @@ Member purchase margins and discounts:
 The app tracks gift card refills by month in `member_monthly_refills`:
 
 - Each member can only have one refill record per month.
-- Use the Members page to mark members as refilled, view pending members, and undo mistakes.
+- Use Members > Gift Cards to search members, edit card numbers, mark refills, skip due refills, and undo mistakes.
 - Save and update each member's gift card number so lost cards can be replaced and re-entered.
 - The gift card tracker is organized by locker number instead of member ID.
 - This helps prevent double refills in the same month.

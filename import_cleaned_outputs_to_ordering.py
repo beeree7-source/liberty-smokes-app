@@ -36,7 +36,6 @@ def main() -> None:
         return
 
     existing_companies = app.load_ordering_companies(pg)
-    existing_reps = app.load_ordering_sales_reps(pg)
 
     company_map = {str(c.get("company") or "").strip().lower(): dict(c) for c in existing_companies}
 
@@ -63,6 +62,8 @@ def main() -> None:
                 "company": company_name,
                 "rep_name": "",
                 "rep_email": "",
+                "rep_phone": "",
+                "rep_brands": "",
                 "active": True,
                 "source_file": "",
                 "order_note": "",
@@ -79,6 +80,8 @@ def main() -> None:
 
         rep_name = str(current.get("rep_name") or "").strip()
         rep_email = str(current.get("rep_email") or "").strip()
+        rep_phone = str(current.get("rep_phone") or "").strip()
+        rep_brands = str(current.get("rep_brands") or "").strip()
 
         for row in file_rows:
             sku = str(row.get("SKU") or "").strip()
@@ -92,10 +95,16 @@ def main() -> None:
 
             rep_name_row = str(row.get("Rep Name") or "").strip()
             rep_email_row = str(row.get("Rep Email") or "").strip()
+            rep_phone_row = str(row.get("Rep Phone") or "").strip()
+            rep_brands_row = str(row.get("Brands") or "").strip()
             if rep_name_row and not rep_name:
                 rep_name = rep_name_row
             if rep_email_row and not rep_email:
                 rep_email = rep_email_row
+            if rep_phone_row and not rep_phone:
+                rep_phone = rep_phone_row
+            if rep_brands_row and not rep_brands:
+                rep_brands = rep_brands_row
 
             item_key = (sku.lower(), name.lower(), box_price)
             existing_items[item_key] = {
@@ -120,6 +129,8 @@ def main() -> None:
         current["company"] = company_name
         current["rep_name"] = rep_name
         current["rep_email"] = rep_email
+        current["rep_phone"] = rep_phone
+        current["rep_brands"] = rep_brands
         current["active"] = True
         current["source_file"] = f"Imported from cleaned_output ({path.name})"
         current["order_rows"] = merged_items
@@ -130,14 +141,9 @@ def main() -> None:
     final_companies = list(company_map.values())
     app.save_ordering_companies(pg, final_companies)
 
-    # Upsert reps from imported company defaults into rep directory.
-    merged_reps = app.upsert_company_reps_into_sales_reps(final_companies, existing_reps)
-    app.save_ordering_sales_reps(pg, merged_reps)
-
     print(f"Imported files: {imported_files}")
     print(f"Processed rows: {imported_rows}")
     print(f"Companies saved: {len(final_companies)}")
-    print(f"Sales reps saved: {len(merged_reps)}")
 
 
 if __name__ == "__main__":
