@@ -52,6 +52,10 @@ def apply_mobile_styles(enabled: bool = True):
     st.markdown(
         """
         <style>
+        section[data-testid="stSidebar"] [data-testid="stRadio"] label p {
+            font-size: 16px !important;
+        }
+
         @media (min-width: 641px) {
             section[data-testid="stSidebar"] {
                 width: 170px !important;
