@@ -52,11 +52,25 @@ def apply_mobile_styles(enabled: bool = True):
     st.markdown(
         """
         <style>
+        @media (min-width: 641px) {
+            section[data-testid="stSidebar"] {
+                width: 170px !important;
+                min-width: 170px !important;
+                max-width: 170px !important;
+            }
+        }
+
         @media (max-width: 900px) {
             .block-container {
-                padding-top: 0.75rem;
+                padding-top: 4rem;
                 padding-left: 0.75rem;
                 padding-right: 0.75rem;
+            }
+
+            h1 {
+                font-size: 1.8rem !important;
+                line-height: 1.2 !important;
+                overflow-wrap: anywhere;
             }
 
             div[data-testid="stSidebar"] {
@@ -7766,17 +7780,28 @@ def load_schedule_employees(pg: SyncPostgrestClient) -> list[dict]:
     ]
 
 
-def send_weekly_schedule_to_employees(pg: SyncPostgrestClient, smtp: dict) -> dict:
+def schedule_week_start(ref: datetime.date | None = None) -> datetime.date:
+    ref = ref or datetime.date.today()
+    return ref - datetime.timedelta(days=(ref.weekday() + 1) % 7)
+
+
+def schedule_day_date(week_start: datetime.date, day: str) -> datetime.date:
+    names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    return week_start + datetime.timedelta(days=names.index(day))
+
+
+def send_weekly_schedule_to_employees(pg: SyncPostgrestClient, smtp: dict, week_start: datetime.date | None = None) -> dict:
     employees = [e for e in load_schedule_employees(pg) if "@" in e["email"]]
     if not employees:
         raise ValueError("Add at least one employee with an email address first.")
     shifts = load_weekly_employee_shifts(pg)
-    lines = ["Here is the weekly employee schedule:", ""]
+    week_start = week_start or schedule_week_start()
+    lines = [f"Here is the employee schedule for the week of {week_start.strftime('%B %d, %Y')}:", ""]
     current_day = ""
     for row in shifts:
         if row["Day"] != current_day:
             current_day = row["Day"]
-            lines.append(current_day)
+            lines.append(f"{current_day}, {schedule_day_date(week_start, current_day).strftime('%b %d')}")
         lines.append(f"  {row['Shift']} ({row['Hours']}): {row['Employee'] or 'Unassigned'}")
     body = "\n".join(lines)
     sent = 0
@@ -7826,7 +7851,7 @@ def page_schedule(pg: SyncPostgrestClient):
         today = datetime.date.today()
         if today.strftime("%A") == auto_day and last_sent != today.isoformat():
             try:
-                stats = send_weekly_schedule_to_employees(pg, smtp_cfg)
+                stats = send_weekly_schedule_to_employees(pg, smtp_cfg, schedule_week_start())
                 st.success(f"Weekly schedule auto-sent to {stats['sent']} employee(s).")
                 last_sent = today.isoformat()
             except Exception as exc:
@@ -7837,7 +7862,14 @@ def page_schedule(pg: SyncPostgrestClient):
     m2.metric("Employees", len(employees))
 
     st.subheader("Weekly Employee Shifts")
-    st.caption("This schedule repeats every week. Edit the hours or employee for each shift, then save.")
+    st.caption("The shifts repeat every week. Pick a week to see its dates, edit the hours or employee, then save.")
+    picked = st.date_input("Week of", value=schedule_week_start(), key="schedule_week_of")
+    week_start = schedule_week_start(picked)
+    st.caption(f"Sunday {week_start.strftime('%b %d')} - Saturday {(week_start + datetime.timedelta(days=6)).strftime('%b %d, %Y')}")
+    weekly_shifts = [
+        {"Day": r["Day"], "Date": schedule_day_date(week_start, r["Day"]).strftime("%a %b %d"), **{k: v for k, v in r.items() if k != "Day"}}
+        for r in weekly_shifts
+    ]
     names = [e["name"] for e in employees if e["name"]]
     options = [""] + names + sorted(
         {str(r["Employee"]) for r in weekly_shifts if r["Employee"] and r["Employee"] not in names}
@@ -7853,7 +7885,7 @@ def page_schedule(pg: SyncPostgrestClient):
         width="stretch",
         hide_index=True,
         num_rows="fixed",
-        disabled=["Day", "Shift"],
+        disabled=["Day", "Date", "Shift"],
         column_config={
             "Hours": st.column_config.TextColumn(
                 "Hours",
@@ -7910,7 +7942,7 @@ def page_schedule(pg: SyncPostgrestClient):
             st.warning("Configure SMTP in Settings before sending.")
         else:
             try:
-                stats = send_weekly_schedule_to_employees(pg, smtp_cfg)
+                stats = send_weekly_schedule_to_employees(pg, smtp_cfg, week_start)
                 st.success(f"Schedule sent to {stats['sent']} employee(s).")
                 if stats["failed"]:
                     st.warning(f"Failed for: {', '.join(stats['failed'])}")
@@ -10066,7 +10098,7 @@ def main():
     with st.sidebar:
         logo_path = get_sidebar_logo_path()
         if logo_path is not None:
-            st.image(str(logo_path), width="stretch")
+            st.image(str(logo_path), width=110)
         page = st.radio(
             "Navigate",
             nav_pages,
@@ -10103,3 +10135,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
