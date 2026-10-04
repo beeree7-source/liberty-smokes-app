@@ -3386,14 +3386,16 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
         upload_names = {}
         for i, upload in enumerate(uploads or []):
             upload_names[i] = st.text_input(
-                f"Name for {upload.name}",
+                f"Name for {upload.name} (each name is saved as its own list)",
                 value=Path(upload.name).stem,
                 key=f"price_list_newname_{company_id}_{gen}_{i}",
             )
         if uploads and st.button("Save price list(s)", key=f"price_list_save_{company_id}", type="primary"):
             for i, upload in enumerate(uploads):
-                save_company_price_list(pg, company_id, upload.name, upload.getvalue())
-                set_price_list_label(pg, company_id, _safe_storage_name(upload.name), upload_names.get(i, ""))
+                label = upload_names.get(i, "").strip() or Path(upload.name).stem
+                stored = _safe_storage_name(label + Path(upload.name).suffix)
+                save_company_price_list(pg, company_id, stored, upload.getvalue())
+                set_price_list_label(pg, company_id, stored, label)
             st.session_state[gen_key] = gen + 1
             st.rerun()
 
