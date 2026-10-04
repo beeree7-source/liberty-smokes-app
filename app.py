@@ -10183,6 +10183,89 @@ def storage_delete_file(category: str, name: str) -> None:
         raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
 
 
+def storage_list_folders(prefix: str) -> list[str]:
+    resp = requests.post(
+        _storage_url(f"object/list/{FILES_BUCKET}"),
+        headers=_storage_headers(),
+        json={"prefix": prefix, "limit": 1000, "sortBy": {"column": "name", "order": "asc"}},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+    return [item["name"] for item in resp.json() if not item.get("id")]
+
+
+def _images_to_pdf(images: list[bytes]) -> bytes:
+    import fitz
+
+    pdf = fitz.open()
+    for img in images:
+        pix = fitz.Pixmap(img)
+        page = pdf.new_page(width=pix.width, height=pix.height)
+        page.insert_image(page.rect, stream=img)
+    out = pdf.tobytes(garbage=3, deflate=True)
+    pdf.close()
+    return out
+
+
+def _render_invoices_section(pg: SyncPostgrestClient):
+    try:
+        existing_companies = storage_list_folders("Invoices")
+        company_names = [c["company"] for c in load_ordering_companies(pg)]
+    except Exception as exc:
+        st.error(f"Could not load invoice folders: {exc}")
+        return
+    company_options = sorted(
+        {_safe_storage_name(n) for n in company_names} | set(existing_companies), key=str.lower
+    )
+    company = st.selectbox("Company", company_options + ["Other (type a name)"], key="inv_company")
+    if company == "Other (type a name)":
+        company = _safe_storage_name(st.text_input("New company folder name", key="inv_company_new"))
+        if company == "file":
+            st.info("Type a company name to continue.")
+            return
+
+    this_year = datetime.date.today().year
+    try:
+        existing_years = storage_list_folders(f"Invoices/{company}")
+    except Exception:
+        existing_years = []
+    years = sorted({str(y) for y in range(this_year, this_year - 8, -1)} | set(existing_years), reverse=True)
+    year = st.selectbox("Year", years, key="inv_year")
+    prefix = f"Invoices/{company}/{year}"
+    st.caption(f"Folder: {prefix}")
+
+    st.markdown("**Scan an invoice with your phone camera**")
+    pages = st.session_state.setdefault("inv_scan_pages", [])
+    counter = st.session_state.setdefault("inv_scan_counter", 0)
+    shot = st.camera_input("Take a photo of the invoice page", key=f"inv_cam_{counter}")
+    if shot is not None and st.button("Add this page", key="inv_add_page"):
+        pages.append(shot.getvalue())
+        st.session_state["inv_scan_counter"] = counter + 1
+        st.rerun()
+    if pages:
+        st.info(f"{len(pages)} page(s) scanned so far. Add more pages or save.")
+        s1, s2 = st.columns(2)
+        if s1.button("Save scan as PDF", type="primary", key="inv_save_scan"):
+            try:
+                pdf_bytes = _images_to_pdf(pages)
+                stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+                storage_upload_file(prefix, f"Invoice_{stamp}.pdf", pdf_bytes, "application/pdf")
+                st.session_state["inv_scan_pages"] = []
+                st.session_state["inv_scan_counter"] = counter + 1
+                st.success("Invoice scan saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save scan: {exc}")
+        if s2.button("Discard scan", key="inv_discard_scan"):
+            st.session_state["inv_scan_pages"] = []
+            st.session_state["inv_scan_counter"] = counter + 1
+            st.rerun()
+
+    st.divider()
+    _render_files_section(pg, prefix, allow_email=False)
+
+
 def _render_files_section(pg: SyncPostgrestClient, category: str, allow_email: bool):
     uploads = st.file_uploader(
         f"Upload {category.lower()} files",
@@ -10333,7 +10416,10 @@ def page_files(pg: SyncPostgrestClient):
     tabs = st.tabs(FILES_CATEGORIES)
     for tab, category in zip(tabs, FILES_CATEGORIES):
         with tab:
-            _render_files_section(pg, category, allow_email=(category == "Licenses"))
+            if category == "Invoices":
+                _render_invoices_section(pg)
+            else:
+                _render_files_section(pg, category, allow_email=(category == "Licenses"))
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
