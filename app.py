@@ -20,7 +20,7 @@ from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import requests
 import streamlit as st
@@ -2016,6 +2016,7 @@ NAV_SHOW_SCHEDULE_KEY = "nav_show_schedule_v1"
 NAV_SHOW_EVENTS_KEY = "nav_show_events_v1"
 NAV_SHOW_ORDERING_KEY = "nav_show_ordering_v1"
 NAV_SHOW_INBOX_KEY = "nav_show_inbox_v1"
+NAV_SHOW_FILES_KEY = "nav_show_files_v1"
 NAV_PAGE_SETTING_KEYS = {
     "Seats": NAV_SHOW_SEATS_KEY,
     "Members": NAV_SHOW_MEMBERS_KEY,
@@ -2024,6 +2025,7 @@ NAV_PAGE_SETTING_KEYS = {
     "Events": NAV_SHOW_EVENTS_KEY,
     "Ordering": NAV_SHOW_ORDERING_KEY,
     "Inbox": NAV_SHOW_INBOX_KEY,
+    "Files": NAV_SHOW_FILES_KEY,
     "POS": NAV_SHOW_POS_KEY,
     "Scanner": NAV_SHOW_SCANNER_KEY,
 }
@@ -10102,6 +10104,238 @@ def page_settings(pg: SyncPostgrestClient):
                     st.error(f"Debug fetch failed: {exc}")
 
 
+# ── Files (Supabase Storage) ───────────────────────────────────────────────────
+
+FILES_BUCKET = "liberty-files"
+FILES_CATEGORIES = ["Licenses", "Invoices", "Other"]
+FILES_SETUP_SQL = """insert into storage.buckets (id, name, public)
+values ('liberty-files', 'liberty-files', false)
+on conflict (id) do nothing;
+
+create policy "liberty files access" on storage.objects
+for all to anon
+using (bucket_id = 'liberty-files')
+with check (bucket_id = 'liberty-files');"""
+
+
+def _storage_headers() -> dict:
+    key = str(st.secrets.get("SUPABASE_KEY") or "").strip()
+    return {"apikey": key, "Authorization": f"Bearer {key}"}
+
+
+def _storage_url(path: str) -> str:
+    return f"{str(st.secrets.get('SUPABASE_URL')).strip().rstrip('/')}/storage/v1/{path}"
+
+
+def _safe_storage_name(name: str) -> str:
+    base = Path(name).name
+    safe = re.sub(r"[^A-Za-z0-9._ ()-]+", "_", base).strip(" .")
+    return safe or "file"
+
+
+def storage_list_files(category: str) -> list[dict]:
+    resp = requests.post(
+        _storage_url(f"object/list/{FILES_BUCKET}"),
+        headers=_storage_headers(),
+        json={"prefix": category, "limit": 1000, "sortBy": {"column": "created_at", "order": "desc"}},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+    return [item for item in resp.json() if item.get("id")]
+
+
+def storage_upload_file(category: str, name: str, data: bytes, mime_type: str = "") -> None:
+    path = f"{category}/{_safe_storage_name(name)}"
+    resp = requests.post(
+        _storage_url(f"object/{FILES_BUCKET}/{quote(path)}"),
+        headers={
+            **_storage_headers(),
+            "Content-Type": mime_type or mimetypes.guess_type(name)[0] or "application/octet-stream",
+            "x-upsert": "true",
+        },
+        data=data,
+        timeout=120,
+    )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+
+
+def storage_download_file(category: str, name: str) -> bytes:
+    resp = requests.get(
+        _storage_url(f"object/{FILES_BUCKET}/{quote(category + '/' + name)}"),
+        headers=_storage_headers(),
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+    return resp.content
+
+
+def storage_delete_file(category: str, name: str) -> None:
+    resp = requests.delete(
+        _storage_url(f"object/{FILES_BUCKET}"),
+        headers=_storage_headers(),
+        json={"prefixes": [f"{category}/{name}"]},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+
+
+def _render_files_section(pg: SyncPostgrestClient, category: str, allow_email: bool):
+    uploads = st.file_uploader(
+        f"Upload {category.lower()} files",
+        accept_multiple_files=True,
+        key=f"files_upload_{category}",
+    )
+    if uploads and st.button(f"Save {len(uploads)} file(s)", type="primary", key=f"files_save_{category}"):
+        failed = []
+        for upload in uploads:
+            try:
+                storage_upload_file(category, upload.name, upload.getvalue(), str(upload.type or ""))
+            except Exception as exc:
+                failed.append(f"{upload.name} ({exc})")
+        if failed:
+            st.error("Some files failed: " + "; ".join(failed))
+        else:
+            st.session_state.pop(f"files_upload_{category}", None)
+            st.success("Uploaded.")
+            st.rerun()
+
+    try:
+        items = storage_list_files(category)
+    except Exception as exc:
+        st.error(f"Could not load files: {exc}")
+        return
+    if not items:
+        st.caption(f"No {category.lower()} files yet.")
+        return
+
+    table = [
+        {
+            "File": item["name"],
+            "Uploaded": str(item.get("created_at") or "")[:10],
+            "Size (KB)": round(int((item.get("metadata") or {}).get("size") or 0) / 1024, 1),
+        }
+        for item in items
+    ]
+    st.dataframe(table, width="stretch", hide_index=True)
+
+    names = [item["name"] for item in items]
+    selected = st.selectbox("Select a file", names, key=f"files_select_{category}")
+    try:
+        data = storage_download_file(category, selected)
+    except Exception as exc:
+        st.error(f"Could not open file: {exc}")
+        return
+
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "Download",
+        data=data,
+        file_name=selected,
+        key=f"files_dl_{category}",
+    )
+    if c2.button("Delete", key=f"files_del_{category}"):
+        try:
+            storage_delete_file(category, selected)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Delete failed: {exc}")
+
+    if selected.lower().endswith(".pdf"):
+        with st.expander("Preview"):
+            try:
+                import fitz
+
+                with fitz.open(stream=data, filetype="pdf") as doc:
+                    pages_b64 = [
+                        base64.b64encode(p.get_pixmap(dpi=150).tobytes("png")).decode() for p in doc
+                    ]
+                _render_zoomable_pages(pages_b64, key=selected)
+            except Exception:
+                st.info("Preview unavailable. Use Download to open it.")
+    elif selected.lower().endswith((".png", ".jpg", ".jpeg")):
+        with st.expander("Preview"):
+            st.image(data)
+
+    if allow_email:
+        st.markdown("**Email this file**")
+        try:
+            companies = [c for c in load_ordering_companies(pg) if c.get("rep_email")]
+            smtp_cfg = load_smtp_settings(pg)
+        except Exception as exc:
+            st.error(f"Could not load companies: {exc}")
+            return
+        labels = {f"{c['company']} ({c['rep_email']})": c["rep_email"] for c in companies}
+        picked = st.multiselect("Send to company reps", list(labels), key=f"files_to_{category}")
+        extra = st.text_input("Other recipient email(s), comma-separated", key=f"files_extra_{category}")
+        subject = st.text_input("Subject", value=f"Liberty Smokes - {Path(selected).stem}", key=f"files_subj_{category}")
+        message = st.text_area(
+            "Message",
+            value="Hello,\n\nPlease find our updated license attached.",
+            key=f"files_msg_{category}",
+        )
+        if st.button("Send file", type="primary", key=f"files_send_{category}"):
+            recipients = [labels[p] for p in picked] + [
+                parseaddr(x)[1] for x in re.split(r"[,;\s]+", extra) if "@" in x
+            ]
+            recipients = list(dict.fromkeys(r for r in recipients if r))
+            if not recipients:
+                st.warning("Choose at least one recipient.")
+            elif not all(smtp_cfg.get(k) for k in ("host", "port", "from_addr", "password")):
+                st.error("Set up the Member email (SMTP) in Settings first.")
+            else:
+                sent, failed = 0, []
+                for addr in recipients:
+                    try:
+                        send_email(
+                            smtp_cfg["host"],
+                            int(smtp_cfg["port"]),
+                            smtp_cfg.get("username", ""),
+                            smtp_cfg.get("password", ""),
+                            addr,
+                            subject,
+                            message,
+                            security=smtp_cfg.get("security", "SSL"),
+                            from_addr=smtp_cfg.get("from_addr", ""),
+                            attachments=[
+                                {
+                                    "filename": selected,
+                                    "mime_type": mimetypes.guess_type(selected)[0] or "application/octet-stream",
+                                    "content": data,
+                                }
+                            ],
+                        )
+                        sent += 1
+                    except Exception:
+                        failed.append(addr)
+                if sent:
+                    st.success(f"Sent to {sent} recipient(s).")
+                if failed:
+                    st.error("Failed: " + ", ".join(failed))
+
+
+def page_files(pg: SyncPostgrestClient):
+    st.header("Files")
+    st.caption("Store licenses and invoices securely, and email licenses to companies.")
+    try:
+        resp = requests.get(_storage_url("bucket"), headers=_storage_headers(), timeout=20)
+        bucket_ready = resp.status_code == 200 and any(b.get("id") == FILES_BUCKET for b in resp.json())
+    except Exception as exc:
+        st.error(f"Could not reach Supabase Storage: {exc}")
+        return
+    if not bucket_ready:
+        st.warning("One-time setup needed: run this in the Supabase dashboard (SQL Editor), then refresh.")
+        st.code(FILES_SETUP_SQL, language="sql")
+        return
+    tabs = st.tabs(FILES_CATEGORIES)
+    for tab, category in zip(tabs, FILES_CATEGORIES):
+        with tab:
+            _render_files_section(pg, category, allow_email=(category == "Licenses"))
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -10165,6 +10399,8 @@ def main():
         page_ordering(pg)
     elif page == "Inbox":
         page_inbox(pg)
+    elif page == "Files":
+        page_files(pg)
     elif page == "POS":
         page_pos(pg)
     elif page == "Scanner":
