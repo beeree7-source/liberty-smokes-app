@@ -5260,14 +5260,38 @@ def load_ordering_imap_settings(pg: SyncPostgrestClient) -> dict:
     }
 
 
+GENERIC_EMAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com", "icloud.com",
+    "live.com", "msn.com", "comcast.net", "me.com", "protonmail.com",
+}
+
+
+def _ordering_rep_keywords(pg: SyncPostgrestClient) -> tuple[str, ...]:
+    keywords: set[str] = set()
+    for company in load_ordering_companies(pg):
+        if not company.get("active"):
+            continue
+        names = [str(company.get("company") or "")] + re.split(r"[,;/]", str(company.get("rep_brands") or ""))
+        for name in names:
+            norm = re.sub(r"[^a-z0-9]", "", name.lower())
+            if len(norm) >= 4:
+                keywords.add(norm)
+        domain = parseaddr(str(company.get("rep_email") or ""))[1].lower().rpartition("@")[2]
+        if domain and domain not in GENERIC_EMAIL_DOMAINS:
+            keywords.add(re.sub(r"[^a-z0-9]", "", domain.split(".")[0]) if len(domain.split(".")[0]) >= 4 else domain)
+    return tuple(sorted(k for k in keywords if k))
+
+
 def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limit: int = 25) -> list[dict]:
+    # Entries without "@" are company/brand keywords matched inside the sender address.
+    keywords = sorted({str(a).strip().lower() for a in allowed_addresses if a and "@" not in str(a)})
     allowed = {
         address.lower()
         for raw_address in allowed_addresses
         if (address := parseaddr(str(raw_address or "").strip())[1].strip())
         and re.fullmatch(r"[^@\s\"()<>]+@[^@\s\"()<>]+", address)
     }
-    if not allowed:
+    if not allowed and not keywords:
         return []
     if not settings.get("host") or not settings.get("username") or not settings.get("password"):
         raise ValueError("Configure the IMAP server, inbox address, and password first.")
@@ -5290,6 +5314,7 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
             raise RuntimeError("Could not open the inbox.")
 
         criteria = [f'FROM "{address}"' for address in sorted(allowed)]
+        criteria += [f'FROM "{kw}"' for kw in keywords if re.fullmatch(r"[a-z0-9.\-]+", kw)]
         query = criteria[-1]
         for criterion in reversed(criteria[:-1]):
             query = f"OR {criterion} {query}"
@@ -5314,7 +5339,9 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
             from_name, from_email = parseaddr(str(parsed_message.get("From") or ""))
             from_email = from_email.strip().lower()
             if from_email not in allowed:
-                continue
+                norm_from = re.sub(r"[^a-z0-9]", "", from_email)
+                if not any(kw in norm_from for kw in keywords):
+                    continue
             body_parts = []
             for part in parsed_message.walk():
                 if part.get_content_type() != "text/plain" or part.get_content_disposition() == "attachment":
@@ -5404,7 +5431,7 @@ def _inbox_start_refresh(key: tuple, settings: dict, addresses: tuple) -> thread
 
 def get_rep_inbox(pg: SyncPostgrestClient, wait: bool = True) -> tuple[list[dict], str]:
     settings = load_ordering_imap_settings(pg)
-    addresses = _ordering_rep_addresses(pg)
+    addresses = _ordering_rep_addresses(pg) + _ordering_rep_keywords(pg)
     if not (settings["host"] and settings["username"] and settings["password"]):
         return [], "not_configured"
     if not addresses:
