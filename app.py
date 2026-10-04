@@ -3350,7 +3350,7 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
         return labels.get(f"{company_id}/{f}") or Path(f).stem
 
     title = f"{company_name} Price Lists ({len(files)})" if len(files) > 1 else f"{company_name} Price List"
-    with st.expander(title, expanded=bool(files)):
+    with st.expander(title, expanded=False):
         if not files:
             st.caption("No price list uploaded for this company yet.")
         else:
