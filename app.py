@@ -10196,6 +10196,17 @@ def storage_list_folders(prefix: str) -> list[str]:
     return [item["name"] for item in resp.json() if not item.get("id")]
 
 
+def _enhance_scan(raw: bytes) -> bytes:
+    from PIL import Image, ImageOps
+
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("L")
+    img.thumbnail((1800, 1800))
+    img = ImageOps.autocontrast(img, cutoff=2)
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=80)
+    return out.getvalue()
+
+
 def _images_to_pdf(images: list[bytes]) -> bytes:
     import fitz
 
@@ -10209,16 +10220,197 @@ def _images_to_pdf(images: list[bytes]) -> bytes:
     return out
 
 
+@st.cache_resource
+def _get_ocr():
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+
+        return RapidOCR()
+    except Exception:
+        return None
+
+
+def _ocr_text(img_bytes: bytes) -> str:
+    ocr = _get_ocr()
+    if ocr is None:
+        return ""
+    try:
+        result, _ = ocr(img_bytes)
+    except Exception:
+        return ""
+    return "\n".join(str(item[1]) for item in (result or []))
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+_DATE_PATTERNS = [
+    (re.compile(r"(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)"), "ymd"),
+    (re.compile(r"(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})(?!\d)"), "mdy"),
+    (re.compile(r"\b([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b"), "mondy"),
+]
+
+
+def extract_invoice_date(text: str) -> datetime.date | None:
+    today = datetime.date.today()
+    found: list[tuple[int, int, datetime.date]] = []
+    for pattern, kind in _DATE_PATTERNS:
+        for match in pattern.finditer(text):
+            try:
+                a, b, c = match.groups()
+                if kind == "ymd":
+                    value = datetime.date(int(a), int(b), int(c))
+                elif kind == "mdy":
+                    year = int(c) + (2000 if len(c) == 2 else 0)
+                    value = datetime.date(year, int(a), int(b))
+                else:
+                    month = _MONTHS.get(a.lower())
+                    if not month:
+                        continue
+                    value = datetime.date(int(c), month, int(b))
+            except ValueError:
+                continue
+            if not (2000 <= value.year <= today.year + 1):
+                continue
+            context = re.sub(r"\s", "", text[max(0, match.start() - 30):match.start()].lower())
+            if "due" in context[-12:] or "ship" in context[-12:] or "order" in context[-12:]:
+                priority = 3
+            elif "invoicedate" in context[-14:] or "invdate" in context[-10:]:
+                priority = 0
+            elif "date" in context[-8:]:
+                priority = 1
+            else:
+                priority = 2
+            found.append((priority, match.start(), value))
+    return min(found)[2] if found else None
+
+
+def extract_invoice_number(text: str) -> str:
+    for match in re.finditer(r"invoice\s*(?:no\.?|number|num|#)?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9-]{2,})", text, re.I):
+        candidate = match.group(1)
+        if any(ch.isdigit() for ch in candidate):
+            return candidate
+    return ""
+
+
+def detect_invoice_company(text: str, companies: list[dict]) -> str:
+    haystack = re.sub(r"[^a-z0-9]", "", text.lower())
+    best, best_len = "", 0
+    for company in companies:
+        keys = [company["company"]] + [b for b in re.split(r"[,;/]", company.get("rep_brands") or "") if b.strip()]
+        for key in keys:
+            norm = re.sub(r"[^a-z0-9]", "", key.lower())
+            if len(norm) >= 4 and norm in haystack and len(norm) > best_len:
+                best, best_len = company["company"], len(norm)
+    return best
+
+
+def _reset_invoice_scan():
+    counter = int(st.session_state.get("inv_scan_counter", 0)) + 1
+    st.session_state["inv_scan_pages"] = []
+    st.session_state["inv_scan_open"] = False
+    st.session_state["inv_scan_reviewing"] = False
+    st.session_state["inv_scan_counter"] = counter
+
+
+def _render_invoice_scanner(pg: SyncPostgrestClient, company_options: list[str], companies: list[dict]):
+    ss = st.session_state
+    pages: list[bytes] = ss.setdefault("inv_scan_pages", [])
+    flash = ss.pop("inv_flash", "")
+    if flash:
+        st.success(flash)
+
+    if not ss.get("inv_scan_open") and not pages:
+        if st.button("📷 Scan invoice with camera", key="inv_scan_start"):
+            ss["inv_scan_open"] = True
+            st.rerun()
+        return
+
+    st.markdown("**Scan invoice**")
+    counter = int(ss.setdefault("inv_scan_counter", 0))
+    if ss.get("inv_scan_open"):
+        shot = st.camera_input("Take a photo of each invoice page", key=f"inv_cam_{counter}")
+        if shot is not None:
+            pages.append(_enhance_scan(shot.getvalue()))
+            ss["inv_scan_counter"] = counter + 1
+            st.rerun()
+        if pages:
+            st.caption(f"{len(pages)} page(s) scanned.")
+            st.image(pages[-1], width=160)
+        b1, b2 = st.columns(2)
+        if pages and b1.button("Done scanning", type="primary", key="inv_scan_done"):
+            with st.spinner("Reading the invoice..."):
+                text = ""
+                company = date = number = None
+                for page_bytes in pages[:3]:
+                    text += "\n" + _ocr_text(page_bytes)
+                    company = detect_invoice_company(text, companies)
+                    date = extract_invoice_date(text)
+                    if company and date:
+                        break
+                number = extract_invoice_number(text)
+            ss["inv_scan_open"] = False
+            ss["inv_scan_reviewing"] = True
+            ss["inv_rev_company"] = company if company in company_options else "Other (type a name)"
+            ss["inv_rev_company_new"] = "" if company in company_options else (company or "")
+            ss["inv_rev_date"] = date or datetime.date.today()
+            ss["inv_rev_number"] = number or ""
+            ss["inv_rev_detected"] = bool(company), bool(date)
+            st.rerun()
+        if b2.button("Cancel", key="inv_scan_cancel"):
+            _reset_invoice_scan()
+            st.rerun()
+        return
+
+    detected_company, detected_date = ss.get("inv_rev_detected", (False, False))
+    st.caption(f"{len(pages)} page(s) scanned. Check the details below, then save.")
+    if not (detected_company and detected_date):
+        st.info("Couldn't read everything automatically. Please fill in what's missing.")
+    st.image(pages[0], width=160)
+    company = st.selectbox("Company", company_options + ["Other (type a name)"], key="inv_rev_company")
+    if company == "Other (type a name)":
+        company = _safe_storage_name(st.text_input("Company name", key="inv_rev_company_new"))
+        if company == "file":
+            company = ""
+    inv_date = st.date_input("Invoice date", key="inv_rev_date")
+    number = st.text_input("Invoice number (optional)", key="inv_rev_number").strip()
+    name_parts = [company or "Unknown", inv_date.strftime("%Y-%m-%d"), "Invoice"] + ([number] if number else [])
+    file_name = _safe_storage_name("_".join(name_parts).replace(" ", "_")) + ".pdf"
+    st.caption(f"Will save as Invoices/{company or 'Unknown'}/{inv_date.year}/{file_name}")
+    r1, r2, r3 = st.columns(3)
+    if r1.button("Save invoice", type="primary", key="inv_rev_save"):
+        try:
+            folder = f"Invoices/{company or 'Unknown'}/{inv_date.year}"
+            storage_upload_file(folder, file_name, _images_to_pdf(pages), "application/pdf")
+            _reset_invoice_scan()
+            ss["inv_flash"] = f"Saved {file_name} to {folder}."
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not save scan: {exc}")
+    if r2.button("Add page", key="inv_rev_more"):
+        ss["inv_scan_open"] = True
+        ss["inv_scan_reviewing"] = False
+        st.rerun()
+    if r3.button("Discard", key="inv_rev_discard"):
+        _reset_invoice_scan()
+        st.rerun()
+
+
 def _render_invoices_section(pg: SyncPostgrestClient):
     try:
         existing_companies = storage_list_folders("Invoices")
-        company_names = [c["company"] for c in load_ordering_companies(pg)]
+        companies = load_ordering_companies(pg)
     except Exception as exc:
         st.error(f"Could not load invoice folders: {exc}")
         return
     company_options = sorted(
-        {_safe_storage_name(n) for n in company_names} | set(existing_companies), key=str.lower
+        {_safe_storage_name(c["company"]) for c in companies} | set(existing_companies), key=str.lower
     )
+    safe_companies = [{**c, "company": _safe_storage_name(c["company"])} for c in companies]
+    _render_invoice_scanner(pg, company_options, safe_companies)
+    if st.session_state.get("inv_scan_open") or st.session_state.get("inv_scan_pages"):
+        return
+
+    st.divider()
     company = st.selectbox("Company", company_options + ["Other (type a name)"], key="inv_company")
     if company == "Other (type a name)":
         company = _safe_storage_name(st.text_input("New company folder name", key="inv_company_new"))
@@ -10235,41 +10427,12 @@ def _render_invoices_section(pg: SyncPostgrestClient):
     year = st.selectbox("Year", years, key="inv_year")
     prefix = f"Invoices/{company}/{year}"
     st.caption(f"Folder: {prefix}")
-
-    st.markdown("**Scan an invoice with your phone camera**")
-    pages = st.session_state.setdefault("inv_scan_pages", [])
-    counter = st.session_state.setdefault("inv_scan_counter", 0)
-    shot = st.camera_input("Take a photo of the invoice page", key=f"inv_cam_{counter}")
-    if shot is not None and st.button("Add this page", key="inv_add_page"):
-        pages.append(shot.getvalue())
-        st.session_state["inv_scan_counter"] = counter + 1
-        st.rerun()
-    if pages:
-        st.info(f"{len(pages)} page(s) scanned so far. Add more pages or save.")
-        s1, s2 = st.columns(2)
-        if s1.button("Save scan as PDF", type="primary", key="inv_save_scan"):
-            try:
-                pdf_bytes = _images_to_pdf(pages)
-                stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
-                storage_upload_file(prefix, f"Invoice_{stamp}.pdf", pdf_bytes, "application/pdf")
-                st.session_state["inv_scan_pages"] = []
-                st.session_state["inv_scan_counter"] = counter + 1
-                st.success("Invoice scan saved.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Could not save scan: {exc}")
-        if s2.button("Discard scan", key="inv_discard_scan"):
-            st.session_state["inv_scan_pages"] = []
-            st.session_state["inv_scan_counter"] = counter + 1
-            st.rerun()
-
-    st.divider()
     _render_files_section(pg, prefix, allow_email=False)
 
 
 def _render_files_section(pg: SyncPostgrestClient, category: str, allow_email: bool):
     uploads = st.file_uploader(
-        f"Upload {category.lower()} files",
+        ("Upload files" if "/" in category else f"Upload {category.lower()} files"),
         accept_multiple_files=True,
         key=f"files_upload_{category}",
     )
@@ -10293,7 +10456,7 @@ def _render_files_section(pg: SyncPostgrestClient, category: str, allow_email: b
         st.error(f"Could not load files: {exc}")
         return
     if not items:
-        st.caption(f"No {category.lower()} files yet.")
+        st.caption("No files yet." if "/" in category else f"No {category.lower()} files yet.")
         return
 
     table = [
