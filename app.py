@@ -10312,6 +10312,23 @@ def _reset_invoice_scan():
     st.session_state["inv_scan_counter"] = counter
 
 
+def _render_scan_thumbs(pages: list[bytes]):
+    per_row = 4
+    for start in range(0, len(pages), per_row):
+        cols = st.columns(per_row)
+        for offset, col in enumerate(cols):
+            idx = start + offset
+            if idx >= len(pages):
+                break
+            col.image(pages[idx], caption=f"Page {idx + 1}", width="stretch")
+            if col.button("Remove", key=f"inv_scan_rm_{idx}_{len(pages)}"):
+                pages.pop(idx)
+                if not pages:
+                    st.session_state["inv_scan_open"] = True
+                    st.session_state["inv_scan_reviewing"] = False
+                st.rerun()
+
+
 def _render_invoice_scanner(pg: SyncPostgrestClient, company_options: list[str], companies: list[dict]):
     ss = st.session_state
     pages: list[bytes] = ss.setdefault("inv_scan_pages", [])
@@ -10334,10 +10351,10 @@ def _render_invoice_scanner(pg: SyncPostgrestClient, company_options: list[str],
             ss["inv_scan_counter"] = counter + 1
             st.rerun()
         if pages:
-            st.caption(f"{len(pages)} page(s) scanned.")
-            st.image(pages[-1], width=160)
+            st.caption(f"{len(pages)} page(s) scanned so far. They will be saved together as one PDF. Keep taking photos for more pages, then tap Done scanning.")
+            _render_scan_thumbs(pages)
         b1, b2 = st.columns(2)
-        if pages and b1.button("Done scanning", type="primary", key="inv_scan_done"):
+        if pages and b1.button(f"Done scanning ({len(pages)} page{'s' if len(pages) != 1 else ''})", type="primary", key="inv_scan_done"):
             with st.spinner("Reading the invoice..."):
                 text = ""
                 company = date = number = None
@@ -10362,10 +10379,10 @@ def _render_invoice_scanner(pg: SyncPostgrestClient, company_options: list[str],
         return
 
     detected_company, detected_date = ss.get("inv_rev_detected", (False, False))
-    st.caption(f"{len(pages)} page(s) scanned. Check the details below, then save.")
+    st.caption(f"{len(pages)} page(s) scanned. They will be saved as one PDF. Check the details below, then save.")
     if not (detected_company and detected_date):
         st.info("Couldn't read everything automatically. Please fill in what's missing.")
-    st.image(pages[0], width=160)
+    _render_scan_thumbs(pages)
     company = st.selectbox("Company", company_options + ["Other (type a name)"], key="inv_rev_company")
     if company == "Other (type a name)":
         company = _safe_storage_name(st.text_input("Company name", key="inv_rev_company_new"))
@@ -10431,10 +10448,13 @@ def _render_invoices_section(pg: SyncPostgrestClient):
 
 
 def _render_files_section(pg: SyncPostgrestClient, category: str, allow_email: bool):
+    gen_key = f"files_upload_gen_{category}"
+    if st.session_state.pop(f"files_uploaded_msg_{category}", False):
+        st.success("Uploaded.")
     uploads = st.file_uploader(
         ("Upload files" if "/" in category else f"Upload {category.lower()} files"),
         accept_multiple_files=True,
-        key=f"files_upload_{category}",
+        key=f"files_upload_{category}_{st.session_state.get(gen_key, 0)}",
     )
     if uploads and st.button(f"Save {len(uploads)} file(s)", type="primary", key=f"files_save_{category}"):
         failed = []
@@ -10446,8 +10466,8 @@ def _render_files_section(pg: SyncPostgrestClient, category: str, allow_email: b
         if failed:
             st.error("Some files failed: " + "; ".join(failed))
         else:
-            st.session_state.pop(f"files_upload_{category}", None)
-            st.success("Uploaded.")
+            st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
+            st.session_state[f"files_uploaded_msg_{category}"] = True
             st.rerun()
 
     try:
