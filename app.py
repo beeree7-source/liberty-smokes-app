@@ -3399,14 +3399,10 @@ def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company
             st.session_state[gen_key] = gen + 1
             st.rerun()
 
-def page_ordering(pg: SyncPostgrestClient):
-    st.header("Ordering")
-    st.caption("Select a company to view its ordering details and email its sales rep.")
-
+def _render_company_directory_editor(pg: SyncPostgrestClient):
     companies = load_ordering_companies(pg)
-
-    with st.expander("Company Directory", expanded=True):
-        st.caption("Manage each company's ordering details and single sales rep contact here.")
+    with st.expander("Company Directory (Ordering)", expanded=False):
+        st.caption("Add a company or change its sales rep, website or payment terms. These show on the Ordering page.")
         company_editor_rows = [
             {
                 "Company": str(company.get("company") or ""),
@@ -3479,6 +3475,11 @@ def page_ordering(pg: SyncPostgrestClient):
             save_ordering_companies(pg, updated_companies)
             st.toast("Company directory changes saved.")
 
+
+def page_ordering(pg: SyncPostgrestClient):
+    st.header("Ordering")
+    st.caption("Select a company to view its ordering details and email its sales rep. Add or edit companies in Settings.")
+
     active_companies = [company for company in load_ordering_companies(pg) if company.get("active")]
     company_options = {
         str(company.get("company") or "Unknown Company"): company
@@ -3501,13 +3502,8 @@ def page_ordering(pg: SyncPostgrestClient):
         rep_email = parseaddr(str(selected_company.get("rep_email") or "").strip())[1].strip()
         rep_phone = str(selected_company.get("rep_phone") or "").strip()
         rep_brands = str(selected_company.get("rep_brands") or "").strip()
-        st.write(f"Sales rep: {rep_name or 'Not set'}")
-        if rep_phone:
-            st.caption(f"Phone: {rep_phone}")
-        if rep_brands:
-            st.info(f"Brands: {rep_brands}")
-        else:
-            st.caption("No brands listed for this sales rep.")
+        st.write("**Sales rep:** " + (rep_name or "Not set") + (f"  ·  {rep_phone}" if rep_phone else ""))
+        st.caption(f"Brands: {rep_brands}" if rep_brands else "No brands listed for this sales rep.")
 
         gmail_address = rep_email
         if gmail_address and "@" in gmail_address:
@@ -9946,6 +9942,8 @@ def page_scanner(pg: SyncPostgrestClient):
 
 def page_settings(pg: SyncPostgrestClient):
     st.header("Settings")
+
+    _render_company_directory_editor(pg)
 
     with st.expander("Display", expanded=True):
         st.checkbox(
