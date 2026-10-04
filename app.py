@@ -3200,15 +3200,27 @@ def _price_list_path(company_id: str, file_name: str) -> Path:
     return PRICE_LIST_DIR / safe_id / safe_name
 
 
+def list_company_price_lists(company_id: str) -> list[Path]:
+    folder = _price_list_path(company_id, "x").parent
+    if not folder.is_dir():
+        return []
+    return sorted((f for f in folder.iterdir() if f.is_file()), key=lambda f: f.name.lower())
+
+
+def _sync_primary_price_list(pg: SyncPostgrestClient, company_id: str):
+    files = list_company_price_lists(company_id)
+    companies = load_ordering_companies(pg)
+    for company in companies:
+        if str(company.get("id") or "") == str(company_id):
+            company["price_list_file"] = files[0].name if files else ""
+    save_ordering_companies(pg, companies)
+
+
 def save_company_price_list(pg: SyncPostgrestClient, company_id: str, file_name: str, data: bytes):
     path = _price_list_path(company_id, file_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    companies = load_ordering_companies(pg)
-    for company in companies:
-        if str(company.get("id") or "") == str(company_id):
-            company["price_list_file"] = path.name
-    save_ordering_companies(pg, companies)
+    _sync_primary_price_list(pg, company_id)
 
 
 def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_name: str):
@@ -3216,12 +3228,7 @@ def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_nam
         _price_list_path(company_id, file_name).unlink(missing_ok=True)
     except OSError:
         pass
-    companies = load_ordering_companies(pg)
-    for company in companies:
-        if str(company.get("id") or "") == str(company_id):
-            company["price_list_file"] = ""
-    save_ordering_companies(pg, companies)
-
+    _sync_primary_price_list(pg, company_id)
 
 def _render_zoomable_pages(pages_b64: list[str], key: str = "", height: int = 600):
     imgs = "".join(f'<img src="data:image/png;base64,{b}">' for b in pages_b64)
@@ -3262,55 +3269,63 @@ document.getElementById('fs').onclick=()=>{const w=document.getElementById('wrap
     components.html(html, height=height, scrolling=False)
 
 
+def _render_price_list_file(pg: SyncPostgrestClient, company_id: str, path: Path):
+    data = path.read_bytes()
+    suffix = path.suffix.lower()
+    fkey = hashlib.sha1(f"{company_id}/{path.name}".encode("utf-8")).hexdigest()[:10]
+    try:
+        if suffix == ".pdf":
+            import fitz
+
+            with fitz.open(stream=data, filetype="pdf") as doc:
+                pages_b64 = [
+                    base64.b64encode(page.get_pixmap(dpi=150).tobytes("png")).decode()
+                    for page in doc
+                ]
+            _render_zoomable_pages(pages_b64, key=fkey)
+        elif suffix in {".png", ".jpg", ".jpeg"}:
+            st.image(data)
+        elif suffix == ".csv":
+            st.dataframe(pd.read_csv(io.BytesIO(data)), width="stretch")
+        elif suffix in {".xlsx", ".xls"}:
+            st.dataframe(pd.read_excel(io.BytesIO(data)), width="stretch")
+    except Exception:
+        st.info("Preview unavailable for this file. Use Download to open it.")
+    col_dl, col_rm = st.columns(2)
+    col_dl.download_button("Download", data=data, file_name=path.name, key=f"price_list_download_{fkey}")
+    if col_rm.button("Remove", key=f"price_list_remove_{fkey}"):
+        remove_company_price_list(pg, company_id, path.name)
+        st.rerun()
+
+
 def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company_name: str, file_name: str):
-    with st.expander(f"{company_name} Price List", expanded=bool(file_name)):
-        path = _price_list_path(company_id, file_name) if file_name else None
-        if path and path.exists():
-            data = path.read_bytes()
-            suffix = path.suffix.lower()
-            st.caption(f"Current file: {path.name}")
-            try:
-                if suffix == ".pdf":
-                    import fitz
-
-                    with fitz.open(stream=data, filetype="pdf") as doc:
-                        pages_b64 = [
-                            base64.b64encode(page.get_pixmap(dpi=150).tobytes("png")).decode()
-                            for page in doc
-                        ]
-                    _render_zoomable_pages(pages_b64, key=company_id)
-                elif suffix in {".png", ".jpg", ".jpeg"}:
-                    st.image(data)
-                elif suffix == ".csv":
-                    st.dataframe(pd.read_csv(io.BytesIO(data)), width="stretch")
-                elif suffix in {".xlsx", ".xls"}:
-                    st.dataframe(pd.read_excel(io.BytesIO(data)), width="stretch")
-            except Exception:
-                st.info("Preview unavailable for this file. Use Download to open it.")
-            col_dl, col_rm = st.columns(2)
-            col_dl.download_button(
-                "Download price list",
-                data=data,
-                file_name=path.name,
-                key=f"price_list_download_{company_id}",
-            )
-            if col_rm.button("Remove price list", key=f"price_list_remove_{company_id}"):
-                remove_company_price_list(pg, company_id, path.name)
-                st.rerun()
-        else:
+    files = list_company_price_lists(company_id)
+    title = f"{company_name} Price Lists ({len(files)})" if len(files) > 1 else f"{company_name} Price List"
+    with st.expander(title, expanded=bool(files)):
+        if not files:
             st.caption("No price list uploaded for this company yet.")
-        upload = st.file_uploader(
-            "Upload or replace price list",
+        elif len(files) == 1:
+            st.caption(f"Current file: {files[0].name}")
+            _render_price_list_file(pg, company_id, files[0])
+        else:
+            st.caption("This rep has several price lists. Pick one to view.")
+            tabs = st.tabs([f.stem[:24] or f.name for f in files])
+            for tab, path in zip(tabs, files):
+                with tab:
+                    st.caption(path.name)
+                    _render_price_list_file(pg, company_id, path)
+        gen_key = f"price_list_gen_{company_id}"
+        uploads = st.file_uploader(
+            "Upload price list(s) — add as many as this rep needs",
             type=PRICE_LIST_TYPES,
-            key=f"price_list_upload_{company_id}",
+            accept_multiple_files=True,
+            key=f"price_list_upload_{company_id}_{st.session_state.get(gen_key, 0)}",
         )
-        if upload is not None and st.button("Save price list", key=f"price_list_save_{company_id}", type="primary"):
-            if file_name and path and path.exists() and path.name != Path(upload.name).name:
-                remove_company_price_list(pg, company_id, path.name)
-            save_company_price_list(pg, company_id, upload.name, upload.getvalue())
-            st.success("Price list saved.")
+        if uploads and st.button("Save price list(s)", key=f"price_list_save_{company_id}", type="primary"):
+            for upload in uploads:
+                save_company_price_list(pg, company_id, upload.name, upload.getvalue())
+            st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
             st.rerun()
-
 
 def page_ordering(pg: SyncPostgrestClient):
     st.header("Ordering")
