@@ -11096,27 +11096,44 @@ def page_users(pg: SyncPostgrestClient, me: dict):
     if flash:
         st.success(flash)
 
+    employees = [e for e in load_schedule_employees(pg) if e["name"]]
+    taken = {str(u.get("employee") or "").lower() for u in users}
+    available = [e for e in employees if e["name"].lower() not in taken]
     with st.expander("Add a new user", expanded=not [u for u in users if u["role"] != "admin"]):
-        with st.form("users_add", clear_on_submit=True):
+        if not employees:
+            st.info("Add employees on the Schedule page first, then pick them here.")
+        elif not available:
+            st.info("Every employee on the Schedule already has an account.")
+        else:
+            emp = st.selectbox(
+                "Employee (from the Schedule)",
+                available,
+                format_func=lambda e: f"{e['name']} ({e['email']})" if e["email"] else e["name"],
+                key="users_add_emp",
+            )
+            default_user = (emp["email"].split("@")[0] if emp["email"] else emp["name"].replace(" ", ".")).lower()
+            ek = hashlib.sha1(emp["name"].encode("utf-8")).hexdigest()[:8]
             c1, c2 = st.columns(2)
-            name = c1.text_input("Full name")
-            username = c2.text_input("Username")
-            c3, c4 = st.columns(2)
-            password = c3.text_input("Temporary password", type="password")
-            role = c4.selectbox("Role", ["employee", "admin"])
-            pages = st.multiselect("Pages this employee can open", all_pages, default=[p for p in all_pages if p != "Settings"])
-            if st.form_submit_button("Create user", type="primary"):
+            username = c1.text_input("Username", value=default_user, key=f"users_add_un_{ek}")
+            password = c2.text_input("Temporary password", type="password", key=f"users_add_pw_{ek}")
+            role = st.selectbox("Role", ["employee", "admin"], key=f"users_add_role_{ek}")
+            pages = st.multiselect(
+                "Pages this employee can open", all_pages,
+                default=[p for p in all_pages if p != "Settings"], key=f"users_add_pages_{ek}",
+            )
+            if st.button("Create user", type="primary", key=f"users_add_btn_{ek}"):
                 uname = username.strip().lower()
                 if not uname or len(password) < 8:
                     st.error("Enter a username and a password of at least 8 characters.")
                 elif any(u["username"] == uname for u in users):
                     st.error("That username already exists.")
                 else:
-                    users.append(_make_user(uname, name, password, role, pages))
+                    new_user = _make_user(uname, emp["name"], password, role, pages)
+                    new_user["employee"] = emp["name"]
+                    users.append(new_user)
                     save_app_users(pg, users)
-                    st.session_state["users_flash"] = f"Created {uname}."
+                    st.session_state["users_flash"] = f"Created {uname} for {emp['name']}."
                     st.rerun()
-
     st.subheader("Existing users")
     admin_count = sum(1 for u in users if u["role"] == "admin" and u.get("active", True))
     for u in users:
