@@ -3200,6 +3200,26 @@ def _price_list_path(company_id: str, file_name: str) -> Path:
     return PRICE_LIST_DIR / safe_id / safe_name
 
 
+PRICE_LIST_LABELS_KEY = "price_list_labels_v1"
+
+
+def load_price_list_labels(pg: SyncPostgrestClient) -> dict:
+    try:
+        data = json.loads(get_setting(pg, PRICE_LIST_LABELS_KEY) or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def set_price_list_label(pg: SyncPostgrestClient, company_id: str, file_name: str, label: str):
+    labels = load_price_list_labels(pg)
+    key = f"{company_id}/{file_name}"
+    if label.strip():
+        labels[key] = label.strip()
+    else:
+        labels.pop(key, None)
+    save_setting(pg, PRICE_LIST_LABELS_KEY, json.dumps(labels))
+
 def list_company_price_lists(company_id: str) -> list[Path]:
     folder = _price_list_path(company_id, "x").parent
     if not folder.is_dir():
@@ -3227,6 +3247,10 @@ def remove_company_price_list(pg: SyncPostgrestClient, company_id: str, file_nam
     try:
         _price_list_path(company_id, file_name).unlink(missing_ok=True)
     except OSError:
+        pass
+    try:
+        set_price_list_label(pg, company_id, file_name, "")
+    except Exception:
         pass
     _sync_primary_price_list(pg, company_id)
 
@@ -3300,31 +3324,57 @@ def _render_price_list_file(pg: SyncPostgrestClient, company_id: str, path: Path
 
 def _render_company_price_list(pg: SyncPostgrestClient, company_id: str, company_name: str, file_name: str):
     files = list_company_price_lists(company_id)
+    labels = load_price_list_labels(pg)
+
+    def label_of(f: Path) -> str:
+        return labels.get(f"{company_id}/{f.name}") or f.stem
+
     title = f"{company_name} Price Lists ({len(files)})" if len(files) > 1 else f"{company_name} Price List"
     with st.expander(title, expanded=bool(files)):
         if not files:
             st.caption("No price list uploaded for this company yet.")
-        elif len(files) == 1:
-            st.caption(f"Current file: {files[0].name}")
-            _render_price_list_file(pg, company_id, files[0])
         else:
-            st.caption("This rep has several price lists. Pick one to view.")
-            tabs = st.tabs([f.stem[:24] or f.name for f in files])
-            for tab, path in zip(tabs, files):
-                with tab:
-                    st.caption(path.name)
-                    _render_price_list_file(pg, company_id, path)
+            chosen = files[0]
+            if len(files) > 1:
+                chosen = st.selectbox(
+                    "Price list",
+                    files,
+                    format_func=label_of,
+                    key=f"price_list_pick_{company_id}",
+                )
+            fkey = hashlib.sha1(f"{company_id}/{chosen.name}".encode("utf-8")).hexdigest()[:10]
+            name_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
+            new_label = name_col.text_input(
+                "Name (e.g. the company this list is for)",
+                value=label_of(chosen),
+                key=f"price_list_label_{fkey}",
+            )
+            if btn_col.button("Rename", key=f"price_list_rename_{fkey}"):
+                set_price_list_label(pg, company_id, chosen.name, new_label)
+                st.rerun()
+            st.caption(f"File: {chosen.name}")
+            _render_price_list_file(pg, company_id, chosen)
+
         gen_key = f"price_list_gen_{company_id}"
+        gen = st.session_state.get(gen_key, 0)
         uploads = st.file_uploader(
             "Upload price list(s) — add as many as this rep needs",
             type=PRICE_LIST_TYPES,
             accept_multiple_files=True,
-            key=f"price_list_upload_{company_id}_{st.session_state.get(gen_key, 0)}",
+            key=f"price_list_upload_{company_id}_{gen}",
         )
+        upload_names = {}
+        for i, upload in enumerate(uploads or []):
+            upload_names[i] = st.text_input(
+                f"Name for {upload.name}",
+                value=Path(upload.name).stem,
+                key=f"price_list_newname_{company_id}_{gen}_{i}",
+            )
         if uploads and st.button("Save price list(s)", key=f"price_list_save_{company_id}", type="primary"):
-            for upload in uploads:
+            for i, upload in enumerate(uploads):
                 save_company_price_list(pg, company_id, upload.name, upload.getvalue())
-            st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
+                set_price_list_label(pg, company_id, _price_list_path(company_id, upload.name).name, upload_names.get(i, ""))
+            st.session_state[gen_key] = gen + 1
             st.rerun()
 
 def page_ordering(pg: SyncPostgrestClient):
