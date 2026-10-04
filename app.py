@@ -3524,19 +3524,33 @@ def _uploads_to_attachments(uploads) -> list[dict]:
 
 def page_inbox(pg: SyncPostgrestClient):
     st.header("Inbox")
-    st.caption("Emails from your active sales reps. Reply right here.")
+    st.caption("Emails from your sales reps and from your members. Reply right here.")
 
-    top_left, top_right = st.columns([1, 1])
-    if top_left.button("Refresh", key="inbox_refresh"):
+    if st.button("Refresh", key="inbox_refresh"):
         st.session_state["inbox_nonce"] = int(st.session_state.get("inbox_nonce", 0)) + 1
         st.rerun()
 
-    messages, error = get_rep_inbox(pg)
+    reps_tab, members_tab = st.tabs(["Reps / Companies", "Members"])
+    with reps_tab:
+        _render_inbox_tab(pg, "reps")
+    with members_tab:
+        _render_inbox_tab(pg, "members")
+
+
+def _render_inbox_tab(pg: SyncPostgrestClient, source: str):
+    is_members = source == "members"
+    top_right = st.container()
+
+    messages, error = get_rep_inbox(pg, source=source)
     if error == "not_configured":
         st.info("Set up the inbox connection in Settings → Inbox Email Config (IMAP) first.")
         return
     if error == "no_reps":
-        st.info("Add an email address to an active company on the Ordering page first.")
+        st.info(
+            "No members with email addresses yet."
+            if is_members
+            else "Add an email address to an active company on the Ordering page first."
+        )
         return
     if error == "loading":
         st.info("Still checking your inbox. Click Refresh in a moment.")
@@ -3547,17 +3561,24 @@ def page_inbox(pg: SyncPostgrestClient):
 
     read_ids = load_inbox_read_ids(pg)
     unread = [m for m in messages if m["uid"] not in read_ids]
-    company_by_email = {
-        parseaddr(str(c.get("rep_email") or ""))[1].strip().lower(): str(c.get("company") or "")
-        for c in load_ordering_companies(pg)
-    }
+    if is_members:
+        name_by_email = {}
+        for m in fetch_members(pg):
+            addr = parseaddr(str(m.get("email") or "").strip())[1].strip().lower()
+            if addr:
+                name_by_email[addr] = f"{m.get('first_name', '')} {m.get('last_name', '')}".strip()
+    else:
+        name_by_email = {
+            parseaddr(str(c.get("rep_email") or ""))[1].strip().lower(): str(c.get("company") or "")
+            for c in load_ordering_companies(pg)
+        }
     top_right.metric("Unread", len(unread))
-    if unread and st.button("Mark all as read", key="inbox_mark_all"):
+    if unread and st.button("Mark all as read", key=f"inbox_mark_all_{source}"):
         save_inbox_read_ids(pg, read_ids | {m["uid"] for m in messages})
         st.rerun()
 
     if not messages:
-        st.info("No messages from your sales reps yet.")
+        st.info("No messages from your members yet." if is_members else "No messages from your sales reps yet.")
         return
 
     rep_smtp = load_ordering_smtp_settings(pg)
@@ -3566,7 +3587,7 @@ def page_inbox(pg: SyncPostgrestClient):
         reply_smtp_choice = st.radio(
             "Reply using",
             ["Member SMTP (current default)", "Sales Rep SMTP profile"],
-            key="inbox_reply_sender",
+            key=f"inbox_reply_sender_{source}",
             horizontal=True,
         )
     smtp = rep_smtp if reply_smtp_choice == "Sales Rep SMTP profile" else load_smtp_settings(pg)
@@ -3575,8 +3596,8 @@ def page_inbox(pg: SyncPostgrestClient):
     for index, message in enumerate(messages):
         uid = message["uid"]
         is_unread = uid in {m["uid"] for m in unread}
-        key_suffix = hashlib.sha1(uid.encode("utf-8")).hexdigest()[:10]
-        company = company_by_email.get(message["from_email"], "")
+        key_suffix = hashlib.sha1((source + uid).encode("utf-8")).hexdigest()[:10]
+        company = name_by_email.get(message["from_email"], "")
         subject = str(message.get("subject") or "(no subject)")
         label = f"{'🔵 ' if is_unread else ''}{company + ' — ' if company else ''}{subject}"
         with st.expander(label, expanded=is_unread and index == 0):
@@ -5356,13 +5377,29 @@ def fetch_ordering_rep_emails(settings: dict, allowed_addresses: list[str], limi
         if status != "OK":
             raise RuntimeError("Could not open the inbox.")
 
-        criteria = [f'FROM "{address}"' for address in sorted(allowed)]
-        criteria += [f'FROM "{kw}"' for kw in keywords if re.fullmatch(r"[a-z0-9.\-]+", kw)]
-        query = criteria[-1]
-        for criterion in reversed(criteria[:-1]):
-            query = f"OR {criterion} {query}"
-        status, results = mailbox.search(None, query)
-        message_ids = results[0].split() if status == "OK" and results and results[0] else []
+        if len(allowed) > 30:
+            # Too many addresses for one IMAP OR query: scan recent senders and filter locally.
+            status, results = mailbox.search(None, "ALL")
+            recent = (results[0].split() if status == "OK" and results and results[0] else [])[-400:]
+            message_ids = []
+            for start in range(0, len(recent), 100):
+                chunk = recent[start:start + 100]
+                status, parts = mailbox.fetch(b",".join(chunk).decode(), "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+                if status != "OK":
+                    continue
+                for part in parts:
+                    if isinstance(part, tuple) and isinstance(part[1], bytes):
+                        sender = parseaddr(part[1].decode("utf-8", errors="replace").partition(":")[2].strip())[1].lower()
+                        if sender in allowed:
+                            message_ids.append(part[0].split()[0])
+        else:
+            criteria = [f'FROM "{address}"' for address in sorted(allowed)]
+            criteria += [f'FROM "{kw}"' for kw in keywords if re.fullmatch(r"[a-z0-9.\-]+", kw)]
+            query = criteria[-1]
+            for criterion in reversed(criteria[:-1]):
+                query = f"OR {criterion} {query}"
+            status, results = mailbox.search(None, query)
+            message_ids = results[0].split() if status == "OK" and results and results[0] else []
 
         ordered_ids = sorted(message_ids, key=lambda value: int(value), reverse=True)[:max(1, int(limit))]
         fetched: dict[bytes, bytes] = {}
@@ -5482,14 +5519,29 @@ def _inbox_start_refresh(key: tuple, settings: dict, addresses: tuple) -> thread
     return thread
 
 
-def get_rep_inbox(pg: SyncPostgrestClient, wait: bool = True) -> tuple[list[dict], str]:
+def _member_inbox_addresses(pg: SyncPostgrestClient) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                addr
+                for m in fetch_members(pg)
+                if (addr := parseaddr(str(m.get("email") or "").strip())[1].strip().lower())
+            }
+        )
+    )
+
+
+def get_rep_inbox(pg: SyncPostgrestClient, wait: bool = True, source: str = "reps") -> tuple[list[dict], str]:
     settings = load_ordering_imap_settings(pg)
-    addresses = _ordering_rep_addresses(pg) + _ordering_rep_keywords(pg)
+    if source == "members":
+        addresses = _member_inbox_addresses(pg)
+    else:
+        addresses = _ordering_rep_addresses(pg) + _ordering_rep_keywords(pg)
     if not (settings["host"] and settings["username"] and settings["password"]):
         return [], "not_configured"
     if not addresses:
         return [], "no_reps"
-    key = (settings["username"], settings["host"], tuple(addresses), int(st.session_state.get("inbox_nonce", 0)))
+    key = (source, settings["username"], settings["host"], tuple(addresses), int(st.session_state.get("inbox_nonce", 0)))
     entry = _INBOX_CACHE.get(key) or {}
     fresh = entry.get("result") is not None and time.time() - entry.get("ts", 0) < _INBOX_TTL_SECONDS
     if fresh:
@@ -10717,11 +10769,15 @@ def main():
     unread_count = 0
     if "Inbox" in nav_pages:
         inbox_messages, inbox_error = get_rep_inbox(pg, wait=False)
+        member_messages, member_error = get_rep_inbox(pg, wait=False, source="members")
+        read_ids = load_inbox_read_ids(pg)
         if not inbox_error:
-            read_ids = load_inbox_read_ids(pg)
-            unread_count = sum(1 for m in inbox_messages if m["uid"] not in read_ids)
+            unread_count += sum(1 for m in inbox_messages if m["uid"] not in read_ids)
+        if not member_error:
+            unread_count += sum(1 for m in member_messages if m["uid"] not in read_ids)
+        if not inbox_error or not member_error:
             if unread_count > int(st.session_state.get("inbox_notified_count", 0)):
-                st.toast(f"{unread_count} unread email(s) from sales reps", icon="📬")
+                st.toast(f"{unread_count} unread email(s) in your inbox", icon="📬")
             st.session_state["inbox_notified_count"] = unread_count
 
     with st.sidebar:
