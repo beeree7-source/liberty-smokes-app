@@ -10112,6 +10112,7 @@ FILES_SETUP_SQL = """insert into storage.buckets (id, name, public)
 values ('liberty-files', 'liberty-files', false)
 on conflict (id) do nothing;
 
+drop policy if exists "liberty files access" on storage.objects;
 create policy "liberty files access" on storage.objects
 for all to anon
 using (bucket_id = 'liberty-files')
@@ -10404,8 +10405,13 @@ def page_files(pg: SyncPostgrestClient):
     st.header("Files")
     st.caption("Store licenses and invoices securely, and email licenses to companies.")
     try:
-        resp = requests.get(_storage_url("bucket"), headers=_storage_headers(), timeout=20)
-        bucket_ready = resp.status_code == 200 and any(b.get("id") == FILES_BUCKET for b in resp.json())
+        resp = requests.post(
+            _storage_url(f"object/list/{FILES_BUCKET}"),
+            headers=_storage_headers(),
+            json={"prefix": "", "limit": 1},
+            timeout=20,
+        )
+        bucket_ready = resp.status_code == 200
     except Exception as exc:
         st.error(f"Could not reach Supabase Storage: {exc}")
         return
