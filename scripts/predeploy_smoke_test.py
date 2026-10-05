@@ -13,6 +13,7 @@ REQUIRED_FILES = [
     "requirements.txt",
     ".streamlit/secrets.toml.example",
     "scheduler/run_email_reminders.py",
+    "supabase/harden_production_access.sql",
     "supabase/create_seats_table.sql",
     "supabase/create_members_table.sql",
     "supabase/create_member_monthly_refills_table.sql",

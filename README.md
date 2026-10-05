@@ -74,7 +74,21 @@ The app includes a Sales Ledger page backed by `daily_sales_ledger`:
    - Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`
    - Add values for:
      - `SUPABASE_URL`
-     - `SUPABASE_KEY`
+     - `SUPABASE_SERVICE_ROLE_KEY` — use only the server-only service-role key, never the browser-facing anon key.
+     - `APP_ENCRYPTION_KEY` — a Fernet key used to encrypt SMTP, IMAP, and CigarPOS credentials at rest.
+     - `ADMIN_SETUP_CODE` — a long, random one-time code required to create the first admin account.
+
+## Production Security Setup (Required)
+
+Before deploying this version:
+
+1. Add the three server-only values above to the Streamlit deployment secrets. Do **not** commit them or expose them in browser code.
+2. Run [harden_production_access.sql](./supabase/harden_production_access.sql) once in the Supabase SQL Editor.
+   - This removes the previous anonymous database and file-storage policies.
+   - It adds the transactional `complete_pos_sale` RPC used by checkout, preventing lost inventory updates during concurrent sales.
+3. Re-save each SMTP, IMAP, and CigarPOS password in **Settings**. Existing plaintext values remain usable only to support this one-time migration; new saves are encrypted with `APP_ENCRYPTION_KEY`.
+
+The application intentionally keeps authentication in the secure Streamlit server session instead of treating a client-controlled username as a persistent login token. Users must sign in again after their browser session ends.
 
 ## Run
 
@@ -227,9 +241,9 @@ Notes:
 - Re-run `build_exe.ps1` whenever you want a fresh EXE with new code changes.
 - Each build removes previous `dist` and `build` folders, then creates a fresh output.
 
-## External Scheduler For Reminder Emails
+## External Scheduler For Automated Email
 
-The app now includes a standalone scheduler runner so reminder emails can be sent even when Streamlit is not open.
+The standalone scheduler runner sends automated reminders outside the Streamlit request path, so opening a page never triggers email delivery. Schedule digests remain manual until a dedicated digest worker is configured.
 
 Files:
 
@@ -240,13 +254,14 @@ Files:
 
 1. Configure SMTP and reminder templates in the app Settings page.
 2. In the app Settings, enable `Automated Reminder Emails`.
-3. Register the Windows task (PowerShell):
+3. Configure `APP_ENCRYPTION_KEY` in `.streamlit/secrets.toml` before saving SMTP credentials.
+4. Register the Windows task (PowerShell):
 
 ```powershell
 pwsh -File .\scheduler\register_reminder_task.ps1 -EveryMinutes 15 -Force
 ```
 
-4. Optionally run once immediately:
+5. Optionally run once immediately:
 
 ```powershell
 schtasks /Run /TN "LibertySmokes-ReminderEmails"

@@ -8,6 +8,7 @@ import smtplib
 import tomllib
 
 from postgrest import SyncPostgrestClient
+from cryptography.fernet import Fernet, InvalidToken
 
 EMAIL_TEMPLATE_DEFAULTS = {
     "welcome_subject": "Welcome to Liberty Smokes, {first_name}!",
@@ -53,7 +54,7 @@ def _int_setting(value: str, default: int) -> int:
 
 def load_supabase_credentials(repo_root: Path) -> tuple[str, str]:
     env_url = str(os.getenv("SUPABASE_URL") or "").strip()
-    env_key = str(os.getenv("SUPABASE_KEY") or "").strip()
+    env_key = str(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
     if env_url and env_key:
         return env_url, env_key
 
@@ -62,11 +63,42 @@ def load_supabase_credentials(repo_root: Path) -> tuple[str, str]:
         with secrets_path.open("rb") as fh:
             data = tomllib.load(fh)
         file_url = str(data.get("SUPABASE_URL") or "").strip()
-        file_key = str(data.get("SUPABASE_KEY") or "").strip()
+        file_key = str(data.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
         if file_url and file_key:
             return file_url, file_key
 
-    raise RuntimeError("SUPABASE_URL and SUPABASE_KEY not found in env or .streamlit/secrets.toml")
+    raise RuntimeError(
+        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY not found in env or .streamlit/secrets.toml"
+    )
+
+
+def load_app_encryption_key(repo_root: Path) -> str:
+    env_key = str(os.getenv("APP_ENCRYPTION_KEY") or "").strip()
+    if env_key:
+        return env_key
+
+    secrets_path = repo_root / ".streamlit" / "secrets.toml"
+    if secrets_path.exists():
+        with secrets_path.open("rb") as fh:
+            data = tomllib.load(fh)
+        file_key = str(data.get("APP_ENCRYPTION_KEY") or "").strip()
+        if file_key:
+            return file_key
+    raise RuntimeError("APP_ENCRYPTION_KEY not found in env or .streamlit/secrets.toml")
+
+
+def decrypt_secret(cipher_text: str, encryption_key: str) -> str:
+    if not cipher_text:
+        return ""
+    if not cipher_text.startswith("fernet:"):
+        # Allows one-time migration of values written before encryption was enforced.
+        return cipher_text
+    try:
+        return Fernet(encryption_key.encode("utf-8")).decrypt(
+            cipher_text[len("fernet:"):].encode("utf-8")
+        ).decode("utf-8")
+    except (ValueError, InvalidToken) as exc:
+        raise RuntimeError("Could not decrypt an SMTP credential with APP_ENCRYPTION_KEY.") from exc
 
 
 def get_postgrest_client(url: str, key: str) -> SyncPostgrestClient:
@@ -211,12 +243,12 @@ def load_email_templates(pg: SyncPostgrestClient) -> dict:
     return result
 
 
-def load_smtp_settings(pg: SyncPostgrestClient) -> dict:
+def load_smtp_settings(pg: SyncPostgrestClient, encryption_key: str) -> dict:
     host = get_setting(pg, "smtp_host") or "smtp.gmail.com"
     port_raw = get_setting(pg, "smtp_port") or "465"
     security = (get_setting(pg, "smtp_security") or "SSL").upper()
     username = get_setting(pg, "smtp_username") or get_setting(pg, "smtp_email")
-    password = get_setting(pg, "smtp_password")
+    password = decrypt_secret(get_setting(pg, "smtp_password"), encryption_key)
     from_addr = get_setting(pg, "smtp_from") or username
     try:
         port = int(port_raw)
@@ -375,6 +407,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     try:
         supabase_url, supabase_key = load_supabase_credentials(repo_root)
+        encryption_key = load_app_encryption_key(repo_root)
     except Exception as exc:
         print(f"ERROR: {exc}")
         return 1
@@ -398,7 +431,7 @@ def main() -> int:
         print(f"SKIP: {reason}")
         return 0
 
-    smtp = load_smtp_settings(pg)
+    smtp = load_smtp_settings(pg, encryption_key)
     if not smtp.get("host") or not smtp.get("port") or not smtp.get("from_addr") or not smtp.get("password"):
         message = "smtp not fully configured"
         save_setting(pg, EMAIL_REMINDERS_AUTO_LAST_RESULT_KEY, message)

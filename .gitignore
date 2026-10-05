@@ -21,3 +21,6 @@ dist/
 
 # Uploaded company price lists
 price_lists/
+
+# Generated local database backups
+backups/

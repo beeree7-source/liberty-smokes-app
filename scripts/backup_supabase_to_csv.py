@@ -25,7 +25,7 @@ DEFAULT_TABLES = [
 
 def load_supabase_credentials(repo_root: Path) -> tuple[str, str]:
     env_url = str(os.getenv("SUPABASE_URL") or "").strip()
-    env_key = str(os.getenv("SUPABASE_KEY") or "").strip()
+    env_key = str(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
     if env_url and env_key:
         return env_url, env_key
 
@@ -34,11 +34,13 @@ def load_supabase_credentials(repo_root: Path) -> tuple[str, str]:
         with secrets_path.open("rb") as fh:
             data = tomllib.load(fh)
         file_url = str(data.get("SUPABASE_URL") or "").strip()
-        file_key = str(data.get("SUPABASE_KEY") or "").strip()
+        file_key = str(data.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
         if file_url and file_key:
             return file_url, file_key
 
-    raise RuntimeError("SUPABASE_URL and SUPABASE_KEY not found in env or .streamlit/secrets.toml")
+    raise RuntimeError(
+        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY not found in env or .streamlit/secrets.toml"
+    )
 
 
 def get_postgrest_client(url: str, key: str) -> SyncPostgrestClient:
